@@ -1,0 +1,36 @@
+[package]
+name        = "bitstream-nv"
+version     = "0.0.1"
+description = "Bit-level reads and writes over a caller's bytes, in both bit orders: LSB-first as DEFLATE reads, MSB-first as JPEG, PNG's filters and almost everything else read.  The state is two integers in a @value struct, so the same accumulator runs in an interrupt handler and in a decompressor on a laptop.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`: shifting and masking integers the caller already holds.  No
+# function declares an effect — a bit accumulator has nowhere to put
+# one.
+#
+# It carries `tests/embedded_probe.nv`, so the device claim is BUILT:
+# `bitstream_core` speaks `Int` and `u8` and nothing else, which is what
+# lets a DEFLATE decoder's inner loop compile for a Cortex-M.
+layer       = "core"
+
+category    = "encoding"
+
+tags        = ["bitstream", "bits", "bitreader", "bitwriter", "deflate", "huffman", "embedded", "sans-io"]
+repository  = "https://github.com/novolang/bitstream-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+[docs.pages]
+"README.md" = "Reading and writing values that are not a whole number of bytes"
+
+[dependencies]
+# None.  Shifting an integer needs the language and nothing else, and a
+# dependency here would be a dependency of every compression codec on
+# the grid.

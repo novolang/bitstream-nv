@@ -1,0 +1,336 @@
+// tests/bitstream_tests.nv — the API tests, written against the
+// signatures.
+//
+// They COMPILE today and they FAIL at run, with `not implemented:
+// bitstream.<fn>` from the `todo()` that is each body.  That is the
+// expected state of an interface release: the compiler has checked
+// every signature, every type and every effect row, and nothing else
+// has been checked because there is nothing else yet.
+//
+// WHERE THE VECTORS COME FROM.  A bit stream has no specification of
+// its own — it is the substrate the specifications are written on — so
+// the vectors here are taken from the formats that read one:
+//
+//   * RFC 1951 § 3.1.1 fixes DEFLATE's LSB-first packing, and § 3.2.3
+//     the three-bit block header that is the first thing any inflater
+//     reads;
+//   * RFC 1951 § 3.1.1 also fixes the exception — Huffman codes are
+//     packed MSB-first inside an otherwise LSB-first stream;
+//   * ITU-T T.81 (JPEG) § F.1.2.1 fixes the MSB-first entropy-coded
+//     segment, which is what every other reader in the world does;
+//   * RFC 2083 § 7.2 (PNG) fixes the MSB-first ordering of sub-byte
+//     pixel rows.
+//
+// A hand-worked byte accompanies each, so a reader can check the
+// arithmetic rather than trust it.
+
+use std.test
+use std.bytes
+use bitstream
+use bitstream_core
+
+// A payload written the way a reader can check it against the
+// specification it came from.
+fn hex(s: Str) -> Bytes
+    bytes.from_hex(s) ?? bytes.zeros(0)
+
+// ── The two orders, on the same byte ────────────────────────────────
+
+@test
+fn test_the_two_orders_are_different_numbers_from_the_same_byte()
+    // 0xAB is 1010 1011.  LSB-first the first three bits out are the
+    // low three, 011 = 3; MSB-first they are the high three, 101 = 5.
+    // A stream read in the wrong order does not fail, it answers 5
+    // where it meant 3 — which is why the order is a constructor
+    // argument and not a per-call one.
+    let lo = bitstream.reader(hex("ab"), BitsLsbFirst)
+    match bitstream.read(lo, 3)
+        Ok(v)  => test.assert_eq(v.value, 3)
+        Err(e) => test.fail(e.message())
+
+    let hi = bitstream.reader(hex("ab"), BitsMsbFirst)
+    match bitstream.read(hi, 3)
+        Ok(v)  => test.assert_eq(v.value, 5)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_the_order_enum_maps_onto_the_integer_the_device_half_stores()
+    test.assert_eq(bitstream.order_code(BitsLsbFirst), bitstream_core.lsb_first())
+    test.assert_eq(bitstream.order_code(BitsMsbFirst), bitstream_core.msb_first())
+    // The two constants are distinct, which is the only thing the rest
+    // of the package needs of them.
+    test.assert_true(bitstream_core.lsb_first() != bitstream_core.msb_first(), "the two orders are distinct codes")
+
+// ── DEFLATE's first three bits ──────────────────────────────────────
+
+@test
+fn test_a_deflate_block_header_reads_as_rfc_1951_writes_it()
+    // RFC 1951 § 3.2.3: BFINAL is one bit, BTYPE is the two after it,
+    // both LSB-first.  A final fixed-Huffman block is BFINAL=1,
+    // BTYPE=01, which is the low three bits 011 — the first byte of
+    // every `deflate("")` in the world starts 0x03.
+    let r = bitstream.reader(hex("0300"), BitsLsbFirst)
+    match bitstream.read(r, 1)
+        Err(e)   => test.fail(e.message())
+        Ok(last) =>
+            test.assert_eq(last.value, 1)
+            match bitstream.read(last.reader, 2)
+                Ok(kind) => test.assert_eq(kind.value, 1)
+                Err(e)   => test.fail(e.message())
+
+@test
+fn test_a_stored_block_aligns_after_its_header()
+    // RFC 1951 § 3.2.4: a stored block's three header bits are followed
+    // by padding to the next byte boundary, then LEN and NLEN.  Five
+    // bits of padding is what `align` drops, and `to_align` is what a
+    // reader asks first.
+    let r = bitstream.reader(hex("01050000"), BitsLsbFirst)
+    match bitstream.read(r, 3)
+        Err(e) => test.fail(e.message())
+        Ok(h)  =>
+            test.assert_eq(bitstream.to_align(h.reader), 5)
+            let aligned = bitstream.align(h.reader)
+            test.assert_eq(bitstream.to_align(aligned), 0)
+            test.assert_eq(bitstream.bit_pos(aligned), 8)
+
+// ── Peek and skip: the Huffman pair ─────────────────────────────────
+
+@test
+fn test_peek_does_not_consume_and_skip_does()
+    // A Huffman decoder peeks the longest code its table holds, looks
+    // the prefix up, and skips exactly the length the table says.  A
+    // decoder written with `read` alone would have to put bits back,
+    // and a bit stream has no way to put bits back.
+    let r = bitstream.reader(hex("ab"), BitsLsbFirst)
+    match bitstream.peek(r, 4)
+        Ok(v)  => test.assert_eq(v, 11)
+        Err(e) => test.fail(e.message())
+    // The peek moved nothing.
+    test.assert_eq(bitstream.bit_pos(r), 0)
+
+    match bitstream.skip(r, 4)
+        Err(e) => test.fail(e.message())
+        Ok(s)  =>
+            test.assert_eq(bitstream.bit_pos(s), 4)
+            // 0xAB's high nibble, LSB-first, is 1010 = 10.
+            match bitstream.read(s, 4)
+                Ok(v)  => test.assert_eq(v.value, 10)
+                Err(e) => test.fail(e.message())
+
+// ── Positions, remainders and the end of the buffer ─────────────────
+
+@test
+fn test_the_counts_are_in_bits_because_that_is_the_only_position()
+    let r = bitstream.reader(hex("abcd"), BitsMsbFirst)
+    test.assert_eq(bitstream.bit_pos(r), 0)
+    test.assert_eq(bitstream.bits_left(r), 16)
+    match bitstream.read(r, 5)
+        Err(e) => test.fail(e.message())
+        Ok(v)  =>
+            test.assert_eq(bitstream.bit_pos(v.reader), 5)
+            test.assert_eq(bitstream.bits_left(v.reader), 11)
+
+@test
+fn test_a_read_past_the_end_is_refused_and_moves_nothing()
+    let r = bitstream.reader(hex("ab"), BitsLsbFirst)
+    match bitstream.read(r, 9)
+        Ok(_)  => test.fail("nine bits came out of one byte")
+        Err(e) =>
+            match e
+                BitsExhausted(at, need) =>
+                    test.assert_eq(at, 0)
+                    test.assert_eq(need, 9)
+                _                       => test.fail("expected BitsExhausted: ${e.message()}")
+
+@test
+fn test_a_width_outside_one_to_sixty_four_is_refused()
+    let r = bitstream.reader(hex("abcdef0102030405060708"), BitsLsbFirst)
+    match bitstream.read(r, 0)
+        Ok(_)  => test.fail("a zero-bit read is not a read")
+        Err(e) =>
+            match e
+                BitsWidthOutOfRange(n) => test.assert_eq(n, 0)
+                _                      => test.fail("expected BitsWidthOutOfRange: ${e.message()}")
+    match bitstream.read(r, 65)
+        Ok(_)  => test.fail("sixty-five bits do not fit an Int")
+        Err(e) =>
+            match e
+                BitsWidthOutOfRange(n) => test.assert_eq(n, 65)
+                _                      => test.fail("expected BitsWidthOutOfRange: ${e.message()}")
+
+// ── The writer, and the round trip ──────────────────────────────────
+
+@test
+fn test_the_writer_completes_a_byte_only_when_it_has_eight_bits()
+    // Three bits is not a byte, so `writer_bytes` is still empty and
+    // `writer_bits` is what says where the writer is.
+    match bitstream.write(bitstream.writer(BitsLsbFirst), 3, 3)
+        Err(e) => test.fail(e.message())
+        Ok(w)  =>
+            test.assert_eq(bitstream.writer_bits(w), 3)
+            test.assert_eq(bytes.len(bitstream.writer_bytes(w)), 0)
+            // Five more makes exactly one, and LSB-first the second
+            // field lands ABOVE the first: 3 | (1 << 3) = 11 = 0x0b.
+            match bitstream.write(w, 1, 5)
+                Err(e2) => test.fail(e2.message())
+                Ok(w2)  =>
+                    test.assert_eq(bitstream.writer_bits(w2), 8)
+                    test.assert_eq(bytes.to_hex(bitstream.writer_bytes(w2)), "0b")
+
+@test
+fn test_a_partial_byte_is_padded_with_zeros_by_write_align()
+    // RFC 1951 § 3.2.3: the bit stream is padded to a byte boundary
+    // with zeros.  A writer left three bits in has written no byte at
+    // all until this call.
+    match bitstream.write(bitstream.writer(BitsLsbFirst), 3, 3)
+        Err(e) => test.fail(e.message())
+        Ok(w)  =>
+            let padded = bitstream.write_align(w)
+            test.assert_eq(bitstream.writer_bits(padded), 8)
+            test.assert_eq(bytes.to_hex(bitstream.writer_bytes(padded)), "03")
+
+@test
+fn test_a_value_wider_than_its_field_is_refused_and_not_masked()
+    // A value that does not fit its field is the caller's arithmetic
+    // being wrong, and masking it writes a document that decodes to a
+    // different number with nothing to show for it.
+    match bitstream.write(bitstream.writer(BitsMsbFirst), 9, 3)
+        Ok(_)  => test.fail("9 does not fit three bits")
+        Err(e) =>
+            match e
+                BitsValueTooWide(value, n) =>
+                    test.assert_eq(value, 9)
+                    test.assert_eq(n, 3)
+                _                          => test.fail("expected BitsValueTooWide: ${e.message()}")
+
+@test
+fn test_msb_first_writes_the_field_diagram_left_to_right()
+    // What every RFC field diagram means: the first field written is
+    // the one at the left of the byte.  Version 4, header length 5 —
+    // the first byte of every IPv4 header — is 0x45.
+    match bitstream.write(bitstream.writer(BitsMsbFirst), 4, 4)
+        Err(e) => test.fail(e.message())
+        Ok(w)  =>
+            match bitstream.write(w, 5, 4)
+                Err(e2) => test.fail(e2.message())
+                Ok(w2)  => test.assert_eq(bytes.to_hex(bitstream.writer_bytes(w2)), "45")
+
+// ── The device half, on its own terms ───────────────────────────────
+
+@test
+fn test_the_accumulator_fills_a_byte_at_a_time()
+    // The whole protocol: refill while there is room, take while there
+    // are bits.
+    test.assert_eq(bitstream_core.capacity(), 64)
+    test.assert_eq(bitstream_core.max_bits(), 64)
+
+    let empty = bitstream_core.acc_lsb()
+    test.assert_eq(bitstream_core.acc_bits(empty), 0)
+    test.assert_eq(bitstream_core.acc_room(empty), 64)
+
+    let one = bitstream_core.feed(empty, 0xAB as u8)
+    test.assert_eq(bitstream_core.acc_bits(one), 8)
+    test.assert_eq(bitstream_core.acc_room(one), 56)
+
+@test
+fn test_the_accumulator_takes_peeks_and_skips_like_the_reader()
+    let a = bitstream_core.feed(bitstream_core.acc_lsb(), 0xAB as u8)
+
+    let took = bitstream_core.take(a, 3)
+    test.assert_true(took.ok, "three bits came out of eight")
+    test.assert_eq(took.value, 3)
+    test.assert_eq(bitstream_core.acc_bits(took.acc), 5)
+
+    let peeked = bitstream_core.peek(a, 3)
+    test.assert_true(peeked.ok, "a peek of three succeeded")
+    test.assert_eq(peeked.value, 3)
+    // A peek moves nothing.
+    test.assert_eq(bitstream_core.acc_bits(peeked.acc), 8)
+
+    let skipped = bitstream_core.skip(a, 3)
+    test.assert_true(skipped.ok, "a skip of three succeeded")
+    test.assert_eq(bitstream_core.acc_bits(skipped.acc), 5)
+
+@test
+fn test_the_accumulator_reports_a_short_take_rather_than_allocating()
+    // The one place this package answers a flag instead of a `Result`:
+    // a `@value` struct cannot be a `Result` payload, and a bit reader
+    // that allocated to report a refill boundary would allocate once
+    // per byte of a compressed stream.
+    let a = bitstream_core.feed(bitstream_core.acc_msb(), 0xAB as u8)
+    let short = bitstream_core.take(a, 9)
+    test.assert_true(not short.ok, "nine bits did not come out of eight")
+    test.assert_eq(short.value, 0)
+    // And the accumulator comes back untouched, so the caller can
+    // refill and ask again.
+    test.assert_eq(bitstream_core.acc_bits(short.acc), 8)
+
+@test
+fn test_the_accumulator_aligns_to_a_byte_boundary()
+    let a = bitstream_core.feed(bitstream_core.acc_lsb(), 0xAB as u8)
+    let three = bitstream_core.skip(a, 3)
+    test.assert_eq(bitstream_core.to_align(three.acc), 5)
+    let aligned = bitstream_core.align(three.acc)
+    test.assert_eq(bitstream_core.to_align(aligned), 0)
+    test.assert_eq(bitstream_core.acc_bits(aligned), 0)
+
+@test
+fn test_the_sink_emits_whole_bytes_and_keeps_the_remainder()
+    let s = bitstream_core.sink_lsb()
+    test.assert_eq(bitstream_core.sink_bits(s), 0)
+
+    // Three bits: nothing comes out.
+    let first = bitstream_core.put(s, 3, 3)
+    test.assert_true(first.ok, "three bits went in")
+    test.assert_eq(first.len, 0)
+    test.assert_eq(bitstream_core.sink_bits(first.sink), 3)
+
+    // Five more: exactly one byte, and the remainder is empty.
+    let second = bitstream_core.put(first.sink, 1, 5)
+    test.assert_true(second.ok, "five more bits went in")
+    test.assert_eq(second.len, 1)
+    test.assert_eq(second.out[0] as Int, 0x0B)
+    test.assert_eq(bitstream_core.sink_bits(second.sink), 0)
+
+@test
+fn test_the_sink_pads_a_partial_byte_on_flush()
+    let msb = bitstream_core.sink_msb()
+    let partial = bitstream_core.put(msb, 5, 3)
+    test.assert_eq(partial.len, 0)
+    // MSB-first, 101 at the left of the byte is 1010 0000 = 0xA0.
+    let done = bitstream_core.flush(partial.sink)
+    test.assert_eq(done.len, 1)
+    test.assert_eq(done.out[0] as Int, 0xA0)
+    test.assert_eq(bitstream_core.sink_bits(done.sink), 0)
+
+    // A sink already on a boundary flushes nothing.
+    test.assert_eq(bitstream_core.flush(bitstream_core.sink_lsb()).len, 0)
+
+@test
+fn test_a_sink_refuses_a_value_wider_than_its_field()
+    let wide = bitstream_core.put(bitstream_core.sink_lsb(), 9, 3)
+    test.assert_true(not wide.ok, "9 does not fit three bits")
+    test.assert_eq(wide.len, 0)
+
+// ── The handoff between the two halves ──────────────────────────────
+
+@test
+fn test_the_host_reader_hands_its_accumulator_to_the_device_half()
+    // A host parses a header with `read`, then hands the rest of the
+    // stream to a loop written against `bitstream_core`.  The bytes go
+    // separately; this is the state that would otherwise be trapped on
+    // the host side of the split.
+    let r = bitstream.reader(hex("abcd"), BitsLsbFirst)
+    match bitstream.read(r, 3)
+        Err(e) => test.fail(e.message())
+        Ok(v)  =>
+            let a = bitstream.reader_acc(v.reader)
+            test.assert_eq(bitstream_core.acc_bits(a), 5)
+
+@test
+fn test_the_host_writer_hands_its_sink_to_the_device_half()
+    match bitstream.write(bitstream.writer(BitsMsbFirst), 5, 3)
+        Err(e) => test.fail(e.message())
+        Ok(w)  =>
+            let s = bitstream.writer_sink(w)
+            test.assert_eq(bitstream_core.sink_bits(s), 3)

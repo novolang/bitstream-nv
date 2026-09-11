@@ -1,0 +1,14 @@
+# Build outputs.
+_novo/
+
+# The built package binary — a library package still produces one,
+# because its manifest needs a `main`.
+bitstream-nv
+
+# Generated from the sources by `novo doc`; a committed copy is a
+# second original.
+APIDOC.md
+
+# Resolved deps.  There are none — shifting an integer needs the
+# language and nothing else.
+novo.lock

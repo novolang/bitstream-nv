@@ -1,0 +1,291 @@
+// bitstream — a bit reader and a bit writer over a caller's bytes.
+//
+// Every body is a `todo()`.  The signatures are the design, and the
+// compiler checks them as claims; see the README for the stamp.
+//
+// WHAT IT IS.  `bitstream_core` is the accumulator — two integers and
+// an order, no buffer, no allocation.  This module is that accumulator
+// with a byte source and a byte destination attached, so a caller who
+// already has the whole payload in `Bytes` does not write the refill
+// loop.  Everything here is arithmetic over bytes the caller holds;
+// nothing is read and nothing is written, which is why the layer is
+// `core` and no function declares an effect.
+//
+// WHICH MODULE A CALLER WANTS.  This one, unless the caller is a
+// device: a DEFLATE inner loop on a Cortex-M cannot name `Bytes` at
+// all, and `bitstream_core` is the half that was written for it.  The
+// README has the table.
+//
+// WHY THE ACCUMULATOR IS FLATTENED HERE.  `BitReader` and `BitWriter`
+// hold `order`, `hold` and `count` as their own fields rather than
+// holding a `BitAcc` and a `BitSink`.  A `@value` struct may not be a
+// field of a boxed struct — it has no header to be reached through —
+// so the composition that would read best is the one the language
+// refuses, and the three integers are spelled twice on purpose.  The
+// two halves are kept in step by `bitstream_core`'s rules being the
+// only rules: every function here is that module's function with a
+// refill or a drain around it.
+
+// Which end of a byte a stream's bits come out of.
+//
+// The choice belongs to the FORMAT and never to the caller, so it is
+// made once when the reader or the writer is built and is not settable
+// afterwards.  Reading a DEFLATE stream MSB-first does not fail; it
+// produces plausible garbage, which is the failure mode this type
+// exists to make impossible to reach by accident.
+pub enum BitOrder
+    // The next bits come out of the LOW end of the byte.  DEFLATE
+    // (RFC 1951 § 3.1.1), and therefore zlib and gzip.
+    BitsLsbFirst
+    // The next bits come out of the HIGH end of the byte.  JPEG, PNG's
+    // bit-packed rows, sub-byte header fields, and every RFC field
+    // diagram drawn left to right.
+    BitsMsbFirst
+
+// The order as the integer `bitstream_core` stores.
+//
+// The bridge between the two halves: the enum is what a host caller
+// reads, and the integer is what survives `@value` on a device.  A
+// caller mixing the two modules — a host that sets a stream up and
+// hands the accumulator to a device loop — needs exactly this one
+// function.
+//
+// ```novo
+// use bitstream
+//
+// fn main() [io]
+//     println("${bitstream.order_code(BitsLsbFirst)}")   // 0
+// ```
+pub fn order_code(o: BitOrder) -> Int
+    todo("bitstream.order_code")
+
+// What went wrong reading or writing bits.
+//
+// All three are caller faults rather than data faults, which is unusual
+// for a codec and is worth saying: a bit stream carries no framing, no
+// tags and no checksums, so there is nothing in the bytes for this
+// package to find wrong.  A truncated stream is the caller asking for
+// more bits than it supplied.
+//
+// The names are prefixed because a variant is constructed by name
+// across the whole assembly, and `Exhausted` is the name every codec
+// wants.
+pub enum BitError
+    // `n` was outside `1 ..= 64`.  Zero bits is not a read — a caller
+    // that means "nothing" writes no call — and sixty-five do not fit
+    // the `Int` the value travels in.
+    BitsWidthOutOfRange(n: Int)
+    // Fewer than `need` bits were left.  `at` is the bit offset from
+    // the start of the source, which is the only position a bit stream
+    // has.
+    BitsExhausted(at: Int, need: Int)
+    // A value with a bit set above the field it was written into.
+    //
+    // A refusal rather than a silent mask: a value that does not fit
+    // its field is the caller's arithmetic being wrong, and masking it
+    // writes a document that decodes to a different number with nothing
+    // to show for it.
+    BitsValueTooWide(value: Int, n: Int)
+
+// The standard `Error` implementation, so a bit-level fault can be
+// reported by anything that reports errors.
+impl Error for BitError
+    // Answer the one-line report: what was wrong, and at what bit
+    // offset.  The offset is in the text rather than left for the
+    // caller to add, because a bit stream has no other landmark.
+    fn message(self) -> Str
+        todo("bitstream.BitError.message")
+
+// A bit reader over bytes the caller already holds.
+//
+// `src` is borrowed, not copied: the reader never owns the payload and
+// never grows.  `at` is the next byte to pull into the accumulator, and
+// `order`, `hold` and `count` are the accumulator itself — see the
+// module header for why they are flattened.
+pub struct BitReader
+    src: Bytes
+    at: Int
+    order: Int
+    hold: Int
+    count: Int
+
+// A reader over `src`, reading in `order`, positioned at bit zero.
+//
+// ```novo
+// use std.bytes
+// use bitstream
+//
+// fn main() [io]
+//     let r = bitstream.reader(bytes.from_hex("ab") ?? bytes.zeros(0), BitsLsbFirst)
+//     println("${bitstream.bits_left(r)}")   // 8
+// ```
+pub fn reader(src: Bytes, order: BitOrder) -> BitReader
+    todo("bitstream.reader")
+
+// A read that succeeded: the reader after it, and the value.
+//
+// The reader is answered rather than mutated because a `core` package
+// is a state machine — the caller threads the new reader into the next
+// call, and a reader it kept a copy of still reads the old position.
+// That is what makes a speculative parse cheap: keep the reader from
+// before the attempt, and the attempt costs nothing to abandon.
+pub struct BitRead
+    reader: BitReader
+    value: Int
+
+// Read `n` bits, `1 ..= 64`.
+//
+// The value arrives right-aligned whichever order the stream is packed
+// in, so a read of 3 answers `0 ..= 7` and the caller's arithmetic does
+// not change with the format.
+//
+// A read of 64 whose top bit is set answers a NEGATIVE `Int`: the value
+// travels in a signed 64-bit integer and that is the bit pattern.  A
+// caller who wants the unsigned reading reads 32 and 32.
+//
+// ```novo
+// use std.bytes
+// use bitstream
+//
+// fn main() [io]
+//     // 0xAB is 1010 1011; LSB-first the first three bits out are 011.
+//     let r = bitstream.reader(bytes.from_hex("ab") ?? bytes.zeros(0), BitsLsbFirst)
+//     match bitstream.read(r, 3)
+//         Ok(v)  => println("${v.value}")     // 3
+//         Err(e) => println(e.message())
+// ```
+pub fn read(r: BitReader, n: Int) -> Result<BitRead, BitError>
+    todo("bitstream.read")
+
+// Look at the next `n` bits without consuming them.
+//
+// Half of the Huffman pair: peek the longest code a table holds, look
+// the prefix up, then `skip` exactly the length the table says.  A
+// decoder written with `read` alone has to put bits back, and a bit
+// stream has no way to put bits back.
+pub fn peek(r: BitReader, n: Int) -> Result<Int, BitError>
+    todo("bitstream.peek")
+
+// Drop the next `n` bits and answer the reader after them.
+//
+// The other half of the Huffman pair.  `n` is `1 ..= 64`; a caller
+// skipping a longer run calls it more than once, which is what a bit
+// stream costs.
+pub fn skip(r: BitReader, n: Int) -> Result<BitReader, BitError>
+    todo("bitstream.skip")
+
+// Advance to the next byte boundary, discarding up to seven bits.
+//
+// Never fails — a reader already on a boundary discards nothing — which
+// is why it answers the reader rather than a `Result`.  DEFLATE's
+// stored block starts here, and so does every format whose header ends
+// on a boundary.
+pub fn align(r: BitReader) -> BitReader
+    todo("bitstream.align")
+
+// How many bits of `src` the reader has consumed, counted from bit
+// zero.
+//
+// The only position a bit stream has.  A caller that needs a byte
+// offset divides by eight and checks `to_align` for the remainder.
+pub fn bit_pos(r: BitReader) -> Int
+    todo("bitstream.bit_pos")
+
+// How many bits of `src` are left: the buffered bits plus eight per
+// byte not yet pulled in.
+//
+// What a caller checks before a read it cannot afford to have refused.
+pub fn bits_left(r: BitReader) -> Int
+    todo("bitstream.bits_left")
+
+// How many bits stand between the reader and the next byte boundary,
+// `0 ..= 7`.
+//
+// A caller that wants the boundary calls `align`; a caller that wants
+// to know whether it is already on one — a stored block's header asks
+// exactly this — reads the number.
+pub fn to_align(r: BitReader) -> Int
+    todo("bitstream.to_align")
+
+// A bit writer accumulating bytes.
+//
+// `out` is a list of byte values rather than `Bytes` because the
+// runtime's `Bytes` cannot be appended to element by element; a caller
+// who needs the finished payload calls `writer_bytes`.  `order`, `hold`
+// and `count` are the sink, flattened for the reason in the module
+// header, and `count` never exceeds seven: every write emits the whole
+// bytes it completed.
+//
+// A caller who cannot afford the list writes with `bitstream_core`
+// instead, which emits into a fixed inline array and allocates nothing.
+pub struct BitWriter
+    out: [Int]
+    order: Int
+    hold: Int
+    count: Int
+
+// A writer in `order`, with nothing in it.
+pub fn writer(order: BitOrder) -> BitWriter
+    todo("bitstream.writer")
+
+// Write the low `n` bits of `value`, `1 ..= 64`.
+//
+// A value with a bit set above `n` is `BitsValueTooWide` rather than a
+// silent mask — see the variant for why.
+//
+// ```novo
+// use bitstream
+//
+// fn main() [io]
+//     // Three bits and then five: one byte exactly.
+//     match bitstream.write(bitstream.writer(BitsLsbFirst), 3, 3)
+//         Ok(w)  => println("${bitstream.writer_bits(w)}")   // 3
+//         Err(e) => println(e.message())
+// ```
+pub fn write(w: BitWriter, value: Int, n: Int) -> Result<BitWriter, BitError>
+    todo("bitstream.write")
+
+// Pad to the next byte boundary with zero bits.
+//
+// Never fails, so it answers the writer.  The padding is zeros because
+// that is what DEFLATE's final block and every other aligned format
+// specify; a format that pads with ones writes them with `write` first.
+pub fn write_align(w: BitWriter) -> BitWriter
+    todo("bitstream.write_align")
+
+// How many bits the writer has taken, counted from bit zero.
+//
+// Not the same as eight times the byte count: a writer three bits in
+// has written no byte at all, and this is what says so.
+pub fn writer_bits(w: BitWriter) -> Int
+    todo("bitstream.writer_bits")
+
+// The bytes the writer has completed.
+//
+// A partial byte is NOT included: a caller who wants it calls
+// `write_align` first.  Leaving it out is deliberate — a stream
+// finished with a half byte in it is a caller that forgot the padding,
+// and answering seven bits as eight would hide that.
+pub fn writer_bytes(w: BitWriter) -> Bytes
+    todo("bitstream.writer_bytes")
+
+// ── The handoff to the device half ──────────────────────────────────
+
+// The reader's accumulator, as `bitstream_core` holds it.
+//
+// The one function a program that straddles the two halves needs: a
+// host that parsed a header with `read` hands the rest of the stream to
+// a loop written against `bitstream_core`, which allocates nothing and
+// compiles for a device.  The bytes go with it separately — that is the
+// split, and this is the state that would otherwise be trapped on this
+// side of it.
+pub fn reader_acc(r: BitReader) -> BitAcc
+    todo("bitstream.reader_acc")
+
+// The writer's sink, as `bitstream_core` holds it.
+//
+// The mirror of `reader_acc`, and the same handoff: a host that wrote a
+// header hands the sink to an encoder that emits into an inline array
+// instead of growing a list.
+pub fn writer_sink(w: BitWriter) -> BitSink
+    todo("bitstream.writer_sink")
