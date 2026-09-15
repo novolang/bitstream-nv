@@ -1,182 +1,270 @@
 # bitstream-nv
 
-**Status: NOT IMPLEMENTED — interface only.**
+Many formats store values that are not a whole number of bytes: a
+three-bit block header, a five-bit pixel, a Huffman code of any length
+from one to fifteen. Reading them means reading bits rather than bytes.
+This package reads and writes 1 to 64 bits at a time over bytes the
+caller already holds, in both of the bit orders that real formats use.
 
-Every public function below is published with its signature and its
-effect row, and every body is `todo()`.  Installing this package works;
-calling it panics with `not implemented`.
+**Status: NOT IMPLEMENTED — interface only.** Every function is declared
+with its full signature, but every body is a `todo()` that panics when
+called. The package is published so its design can be reviewed and
+depended on before it is implemented. Version 0.1.0 will be the first
+working release.
 
-## What this is
+## What a bit stream is
 
-Values that are not a whole number of bytes: read 1 to 64 bits at a
-time out of bytes a caller already holds, and write them back.  Peek
-without consuming, skip without reading, align to a byte boundary, and
-ask where you are — in bits, because bits are the only position a bit
-stream has.
+A bit stream is a run of bytes read as one long sequence of bits. A
+reader keeps an **accumulator**: an integer holding the bits pulled out
+of the source but not yet handed to the caller, and a count of how many
+of them are live. A read of `n` bits takes them off the accumulator, and
+the accumulator is refilled a byte at a time.
 
-Two modules, and the split is the point.  `bitstream_core` is the
-accumulator on its own — two integers and an order in a `@value` struct,
-no buffer, no allocation, and it compiles for a Cortex-M.
-`bitstream` is that accumulator with a `Bytes` source and a byte sink
-attached, for a caller who already has the whole payload and does not
-want to write the refill loop.
+The **bit order** says which end of each byte the first bit comes from.
+**LSB-first** takes the least significant bit of the byte first.
+**MSB-first** takes the most significant bit first. A stream is one
+order from end to end, and both orders are in wide use.
 
-## Which bit order a format wants
+A stream read in the wrong order does not fail. It answers plausible
+numbers, because every bit pattern is a legal reading of some value.
+This is the fact a reader of this package most often came for, so it is
+a table.
 
-This is the fact a reader of this package came for, so it is a table.
-
-| format | order | where it says so |
+| Format | Order | Where it says so |
 | --- | --- | --- |
-| DEFLATE, zlib, gzip — everything but the Huffman codes | **LSB-first** | RFC 1951 § 3.1.1 |
-| DEFLATE's Huffman codes, inside that same stream | **MSB-first** | RFC 1951 § 3.1.1 |
-| JPEG entropy-coded segments | **MSB-first** | ITU-T T.81 § F.1.2.1 |
-| PNG sub-byte pixel rows (1, 2, 4 bpp) | **MSB-first** | RFC 2083 § 7.2 |
-| Brotli | **LSB-first** | RFC 7932 § 1.2 |
-| LZMA / xz range coder | **MSB-first** | the xz format specification § 4 |
-| protocol field diagrams drawn left to right | **MSB-first** | every RFC that draws one |
+| DEFLATE, zlib and gzip, other than the Huffman codes | LSB-first | RFC 1951 section 3.1.1 |
+| DEFLATE's Huffman codes, inside that same stream | MSB-first | RFC 1951 section 3.1.1 |
+| JPEG entropy-coded segments | MSB-first | ITU-T T.81 section F.1.2.1 |
+| PNG pixel rows of 1, 2 or 4 bits | MSB-first | RFC 2083 section 7.2 |
+| Brotli | LSB-first | RFC 7932 section 1.2 |
+| LZMA and the xz range coder | MSB-first | the xz format specification section 4 |
+| Protocol field diagrams drawn left to right | MSB-first | every RFC that draws one |
 
-**DEFLATE's split is not a mistake in the table.**  RFC 1951 packs data
-elements starting from the least-significant bit, and Huffman codes
-starting from the most-significant bit of the code, in the same stream.
-An inflater therefore reads its block header, its lengths and its extra
-bits LSB-first and its codes MSB-first — which in practice is done by
-reading the code LSB-first and reversing it, because reversing a short
-code is cheaper than running two accumulators.  A decoder built on this
-package does the same: one `BitsLsbFirst` reader, and the code reversal
-in the Huffman table where it belongs.
+DEFLATE appears twice, and that is what RFC 1951 section 3.1.1 says.
+Data elements are packed starting at the least significant bit, and
+Huffman codes are packed starting at the most significant bit of the
+code, in one stream. An inflater reads the header, the lengths and the
+extra bits LSB-first. It reads each code LSB-first as well and reverses
+it, because reversing a code of at most fifteen bits costs less than
+running two accumulators.
 
-Everything else in the table is MSB-first, which is why the order is a
-constructor argument with no default.  A stream read in the wrong order
-does not fail — it answers plausible numbers — and that is the failure
-this package's shape exists to make hard to reach by accident.
+**Alignment** is the third idea. Some formats resume on a byte boundary
+after a header, so a reader must be able to discard the bits up to the
+next boundary. DEFLATE's stored block does this.
 
-## Adding it, and checking it
+| Quantity | Value |
+| --- | --- |
+| Bits one read or write may ask for | 1 to 64 |
+| Bits the accumulator holds | 64 |
+| Bits of room one refill needs | 8 |
+| Bits a writer holds back between writes | 0 to 7 |
+| Whole bytes one write can complete | 0 to 8 |
+| Bits discarded by an alignment | 0 to 7 |
 
-```bash
-novo pkg add bitstream-nv     # into your novo.toml
-novo pkg build                # type- and effect-check the package
-novo test --isolate tests/bitstream_tests.nv
+## Install
+
+```
+novo pkg add bitstream-nv
 ```
 
-`novo test` is red today and that is the point of the release: every
-assertion fails with `not implemented: bitstream.<fn>`.  They turn green
-one at a time as bodies land.
+## Example
 
-## The one example that will work
-
-The first three bits of every DEFLATE stream: BFINAL, then the two bits
-of BTYPE, both LSB-first (RFC 1951 § 3.2.3).
+Every DEFLATE stream opens with a one-bit final flag and a two-bit block
+type, both LSB-first, as RFC 1951 section 3.2.3 describes.
 
 ```novo
 use std.bytes
 use bitstream
 
 fn main() [io]
+    // A reader over two bytes, LSB-first, positioned at bit zero.
     let r = bitstream.reader(bytes.from_hex("0300") ?? bytes.zeros(0), BitsLsbFirst)
+
+    // BFINAL: one bit, 1 when this is the last block of the stream.
     match bitstream.read(r, 1)
         Err(e)   => println(e.message())
         Ok(last) =>
+            // BTYPE: two bits, 1 for a block with the fixed Huffman
+            // tables. The reader from the previous read carries the
+            // position forward.
             match bitstream.read(last.reader, 2)
-                Err(e)    => println(e.message())
-                Ok(kind)  => println("final=${last.value} type=${kind.value}")
-                            // final=1 type=1 — a final fixed-Huffman block
+                Err(e)   => println(e.message())
+                Ok(kind) => println("final=${last.value} type=${kind.value}")
 ```
 
-## The load-bearing interface
+Build and test with `novo pkg build` and `novo test`. Today `novo test`
+fails on purpose: every test reaches a `not implemented: bitstream.<fn>`
+panic. The tests are the specification the implementation will have to
+satisfy.
 
-`BitAcc` and its three fields, in `bitstream_core`:
+## What the package contains
 
-```novo
-pub @value
-struct BitAcc
-    order: Int
-    hold: Int
-    count: Int
+| Module | Contents |
+| --- | --- |
+| `bitstream_core` | The accumulator and its mirror the sink: two integers and an order each, with take, peek, skip, align, put and flush. It holds no buffer and allocates nothing. |
+| `bitstream` | A reader over a `Bytes` and a writer that collects finished bytes, with the bit order as an enum, the three named refusals, and the position and remaining counts. |
+
+## How to choose an entry point
+
+**`bitstream.reader` and `bitstream.writer` are for a caller holding the
+whole payload.** They refill and drain the accumulator for you, and they
+answer a `Result` on a bad call.
+
+**`bitstream_core.acc_lsb` and `acc_msb` are for a caller who owns the
+bytes.** You feed the accumulator a byte at a time and check
+`acc_room` before each refill. Nothing is allocated, so this is the form
+a device and an interrupt handler use.
+
+**`bitstream.reader_acc` and `bitstream.writer_sink` cross between
+them.** They answer the plain accumulator and sink inside a host reader
+or writer. A program that parses a header on a host and runs the inner
+loop on a device needs those two calls.
+
+## The rules a user needs
+
+1. **The bit order is chosen once, at the constructor, and never
+   changes.** It is a field of the value rather than a choice per call.
+   A stream is one order from end to end, and the table above says which
+   order each format uses.
+2. **A value arrives right-aligned in both orders.** A read of 3 answers
+   0 to 7 whichever way the stream is packed, so the caller's arithmetic
+   does not change with the format.
+3. **A read of 64 bits whose top bit is set answers a negative number.**
+   The value travels in an `Int`, which is signed and 64 bits wide, and
+   that is the bit pattern. A caller who wants the unsigned reading
+   reads 32 bits and 32 bits and combines them.
+4. **A width outside 1 to 64 is refused.** That is
+   `BitsWidthOutOfRange`. Zero bits is not a read: a caller who means
+   nothing writes no call.
+5. **A read past the end is refused and moves nothing.**
+   `BitsExhausted(at, need)` gives the bit offset and the width asked
+   for. The reader comes back unchanged, so a speculative parse costs
+   nothing to abandon.
+6. **A value with a bit set above its field is refused, not masked.**
+   That is `BitsValueTooWide`. A masked value writes a document that
+   decodes to a different number.
+7. **Every position is counted in bits.** `bit_pos`, `bits_left` and
+   `to_align` are all bit counts, because a bit stream has no other
+   landmark. A caller wanting a byte offset divides by eight.
+8. **`bitstream_core` answers a flag, not a `Result`.** `BitTake.ok` and
+   `BitEmit.ok` are false for a call that did not happen, and the value
+   comes back unchanged. A `@value` struct cannot be a `Result` payload,
+   and a reader that allocated at each refill boundary would allocate
+   once per byte of a compressed stream.
+9. **`bitstream_core.feed` needs eight bits of room.** Check
+   `acc_room` first. A byte fed with less room is dropped and the
+   accumulator comes back unchanged.
+10. **Alignment discards bits and pads with zeros.** `align` drops up to
+    seven bits and never fails. `write_align` and
+    `bitstream_core.flush` pad the partial byte with zero bits. A format
+    that pads with ones writes them itself first.
+11. **A Huffman decoder peeks and then skips.** Peek the longest code
+    the table holds, look the prefix up, then skip exactly the length
+    the table gives. A bit stream has no way to put bits back.
+
+## Running on a microcontroller
+
+novo-lang lets a package state which of its modules can run on a device
+with no heap allocator, and the compiler checks that claim on every
+build. Here the claim covers `bitstream_core` and nothing else. It takes
+and answers `Int` and `u8`, and it holds no buffer.
+
+`tests/embedded_probe.nv` is that claim as a program that either builds
+or does not. It builds today:
+
+```bash
+novo build --target=nrf52-qemu tests/embedded_probe.nv
 ```
 
-Everything else in the package is that value with something attached.
-The host reader is `BitAcc` plus a `Bytes` and a byte index; the host
-writer is its mirror plus a list of finished bytes; `reader_acc` and
-`writer_sink` hand the value back so a program that parsed a header on
-the host can run the inner loop on a device.
+The probe produces a Cortex-M4 executable that fills an accumulator,
+takes, peeks, skips and aligns, then writes fields back through the
+sink. It builds and it is not run: every function it calls is a `todo()`
+today.
 
-Three consequences a reviewer should push on:
+**A device cannot use the `bitstream` module.** That module speaks
+`Bytes`, and the embedded runtime defines none of the byte-buffer
+symbols. One host-only function anywhere in a compilation unit is an
+undefined symbol at link time on a device, whether or not the firmware
+calls it. That is why the package is two modules.
 
-- **The order is a field, not two function families.**  A stream is one
-  order from end to end, so the choice is made once at the constructor.
-  Two families would let a caller feed LSB-first and take MSB-first with
-  no diagnostic.
-- **The device half answers a flag, not a `Result`.**  `BitTake` and
-  `BitEmit` carry `ok: Bool`.  A `@value` struct cannot be a `Result`
-  payload, and a bit reader that allocated to report a refill boundary
-  would allocate once per byte of a compressed stream.  The host half
-  does answer `Result<_, BitError>`, because by then the allocation has
-  already happened.
-- **The accumulator is spelled twice.**  `BitReader` holds `order`,
-  `hold` and `count` as its own fields rather than holding a `BitAcc`: a
-  `@value` struct may not be a field of a boxed struct.  The composition
-  that would read best is the one the language refuses, and the two
-  halves are kept in step by `bitstream_core`'s rules being the only
-  rules.
+## What is not included
 
-## The layer, and why
+- **Any check on the data.** A bit stream carries no framing, no tags
+  and no checksums, so there is nothing in the bytes to find wrong. All
+  three refusals are caller faults, and a truncated stream reaches the
+  caller as a read asking for more bits than were supplied.
+- **A read wider than 64 bits.** The value travels in one `Int`. A
+  caller reading a wider field reads it in pieces.
+- **An unsigned 64-bit read.** See rule 3.
+- **Input and output.** The reader takes bytes the caller already holds,
+  and the writer answers bytes for the caller to write somewhere. No
+  function here declares an effect.
+- **Huffman tables, and the code reversal a DEFLATE decoder needs.**
+  Those belong to the codec that owns the table.
+- **A growable `Bytes` writer in the core half.** `BitWriter` collects
+  its output in a list, which a device cannot allocate. Firmware writes
+  through `bitstream_core.put`, which emits into an inline array of
+  eight bytes.
 
-`core`.  Everything here is shifting and masking integers the caller
-already holds, and no function declares an effect — a bit accumulator
-has nowhere to put one.
+## Related packages
 
-It carries `tests/embedded_probe.nv`, so the device claim is **built**
-rather than asserted: `bitstream_core` speaks `Int` and `u8` and nothing
-else, and the probe compiles to a Cortex-M4 ELF for
-`--target=nrf52-qemu`.  `bitstream` is deliberately outside the probe —
-it speaks `Bytes`, the embedded runtime defines no `novo_bytes_*`
-symbol, and one host-only function anywhere in a compilation unit is an
-undefined symbol at embedded link time whether or not the firmware calls
-it.
+- [flate-nv](https://novo-lang.org/packages/flate-nv) is DEFLATE, zlib
+  and gzip. It is the largest consumer of a bit reader, and the LSB-first
+  order in the table above is its order.
+- [brotli-nv](https://novo-lang.org/packages/brotli-nv) and
+  [zstd-nv](https://novo-lang.org/packages/zstd-nv) are the other
+  compression formats with sub-byte fields.
+- [png-nv](https://novo-lang.org/packages/png-nv) unpacks pixel rows of
+  1, 2 and 4 bits, which is an MSB-first read of a fixed width.
+- [leb128-nv](https://novo-lang.org/packages/leb128-nv) and
+  [varint-nv](https://novo-lang.org/packages/varint-nv) encode integers
+  in a variable number of whole bytes, which needs no bit reader.
+- [base64-nv](https://novo-lang.org/packages/base64-nv) reads six bits
+  at a time out of a fixed twenty-four-bit group, and does its own
+  shifting for that one width.
 
-## Where it sits beside the compression codecs
+## Tests
 
-This package exists because the codecs that need it each wrote it again.
-flate-nv's `DeflateState` and `InflateState` both carry a `bit_buf` and a
-`bit_count`; a PNG reader unpacking 4-bit rows carries the same pair; so
-would a JPEG decoder, an LZMA decoder and a Brotli decoder.  That is one
-encoding kept in step in five places, and the fifth copy is the one that
-gets the fix the first four got.
+```bash
+novo test tests/bitstream_tests.nv      # 21 tests
+```
 
-So the intended shape after implementation is that a compression codec
-depends on this and deletes its own accumulator.  Nothing forces it —
-the codecs are published already and their bit state is private — but
-the interface here is deliberately the shape theirs already have, so the
-change is a substitution rather than a redesign.
+The vectors are bytes from the format specifications in the table above,
+with the arithmetic worked out by hand in a comment beside each one. The
+surface follows `bitvec` in Rust and `bitstring` in Python.
 
-## A read of 64 bits answers a signed number
+The suite asserts that the two orders answer different numbers from the
+same byte, that a DEFLATE block header reads as RFC 1951 writes it, that
+a stored block aligns after its header, that peek does not consume and
+skip does, that the counts are in bits, that a read past the end is
+refused and moves nothing, that a width outside 1 to 64 is refused, that
+a writer completes a byte only when it has eight bits, that a partial
+byte is padded with zeros, that a value wider than its field is refused
+rather than masked, that an MSB-first write puts a field diagram down
+left to right, and that a host reader and writer hand their state to the
+device half unchanged.
 
-The value travels in an `Int`, which is 64 bits and signed, so a read of
-64 whose top bit is set answers a negative number.  That is the bit
-pattern and not a fault.  A caller who wants the unsigned reading reads
-32 and 32 and combines them.  No format in the table above reads a
-64-bit field, so this is a corner rather than a limitation — but it is
-the sort of corner that is cheaper to write down than to find.
+The tests compile today and fail at run, each on the `not implemented`
+panic that is its body. That is the expected state of an interface
+release. They turn green one at a time as bodies land.
 
-## The reference implementation
+## Implementation status
 
-`bitvec` (Rust, MIT) and `bitstring` (Python, MIT) for the surface, and
-the format specifications in the table above for the vectors.  Every
-assertion in `tests/bitstream_tests.nv` is a byte from one of those
-specifications with the arithmetic worked by hand in the comment beside
-it, so a reader can check the port rather than trust it.
-
-## Status
-
-| function | implemented |
+| Item | Implemented |
 | --- | --- |
 | `bitstream_core.lsb_first`, `.msb_first`, `.max_bits`, `.capacity` | no |
 | `bitstream_core.acc_lsb`, `.acc_msb`, `.acc_bits`, `.acc_room`, `.feed` | no |
 | `bitstream_core.take`, `.peek`, `.skip`, `.to_align`, `.align` | no |
 | `bitstream_core.sink_lsb`, `.sink_msb`, `.sink_bits`, `.put`, `.flush` | no |
-| `bitstream.order_code`, `.BitError.message` | no |
+| `bitstream.order_code`, `BitError.message` | no |
 | `bitstream.reader`, `.read`, `.peek`, `.skip`, `.align` | no |
 | `bitstream.bit_pos`, `.bits_left`, `.to_align` | no |
 | `bitstream.writer`, `.write`, `.write_align` | no |
 | `bitstream.writer_bits`, `.writer_bytes` | no |
 | `bitstream.reader_acc`, `.writer_sink` | no |
+
+## Licence
+
+Apache-2.0. See `LICENSE`.
+
+<!-- docs/writing-a-readme.md is the style guide for this page. -->

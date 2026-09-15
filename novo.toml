@@ -1,6 +1,6 @@
 [package]
 name        = "bitstream-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "Bit-level reads and writes over a caller's bytes, in both bit orders: LSB-first as DEFLATE reads, MSB-first as JPEG, PNG's filters and almost everything else read.  The state is two integers in a @value struct, so the same accumulator runs in an interrupt handler and in a decompressor on a laptop.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
