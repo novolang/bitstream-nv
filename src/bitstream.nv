@@ -1,43 +1,35 @@
 // bitstream — a bit reader and a bit writer over a caller's bytes.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
+// `bitstream_core` is the accumulator: two integers and an order, no
+// buffer and no allocation.  This module is that accumulator with a
+// byte source and a byte destination attached, so a caller who already
+// has the whole payload in `Bytes` does not write the refill loop.
+// Nothing is read from or written to the outside, so no function
+// declares an effect.
 //
-// WHAT IT IS.  `bitstream_core` is the accumulator — two integers and
-// an order, no buffer, no allocation.  This module is that accumulator
-// with a byte source and a byte destination attached, so a caller who
-// already has the whole payload in `Bytes` does not write the refill
-// loop.  Everything here is arithmetic over bytes the caller holds;
-// nothing is read and nothing is written, which is why the layer is
-// `core` and no function declares an effect.
-//
-// WHICH MODULE A CALLER WANTS.  This one, unless the caller is a
-// device: a DEFLATE inner loop on a Cortex-M cannot name `Bytes` at
-// all, and `bitstream_core` is the half that was written for it.  The
-// README has the table.
-//
-// WHY THE ACCUMULATOR IS FLATTENED HERE.  `BitReader` and `BitWriter`
-// hold `order`, `hold` and `count` as their own fields rather than
-// holding a `BitAcc` and a `BitSink`.  A `@value` struct may not be a
-// field of a boxed struct — it has no header to be reached through —
-// so the composition that would read best is the one the language
-// refuses, and the three integers are spelled twice on purpose.  The
-// two halves are kept in step by `bitstream_core`'s rules being the
-// only rules: every function here is that module's function with a
-// refill or a drain around it.
+// `BitReader` and `BitWriter` hold `order`, `hold` and `count` as their
+// own fields rather than holding a `BitAcc` and a `BitSink`.  A `@value`
+// struct may not be a field of a boxed struct, so the three integers
+// are spelled twice.  Every function here converts to the core's value,
+// calls the core, and converts back, so the two modules share one set
+// of rules.
+
+use std.bytes
+use std.list
+use bitstream_core
 
 // Which end of a byte a stream's bits come out of.
 //
-// The choice belongs to the FORMAT and never to the caller, so it is
+// The choice belongs to the format and never to the caller, so it is
 // made once when the reader or the writer is built and is not settable
 // afterwards.  Reading a DEFLATE stream MSB-first does not fail; it
 // produces plausible garbage, which is the failure mode this type
 // exists to make impossible to reach by accident.
 pub enum BitOrder
-    // The next bits come out of the LOW end of the byte.  DEFLATE
+    // The next bits come out of the low end of the byte.  DEFLATE
     // (RFC 1951 § 3.1.1), and therefore zlib and gzip.
     BitsLsbFirst
-    // The next bits come out of the HIGH end of the byte.  JPEG, PNG's
+    // The next bits come out of the high end of the byte.  JPEG, PNG's
     // bit-packed rows, sub-byte header fields, and every RFC field
     // diagram drawn left to right.
     BitsMsbFirst
@@ -57,7 +49,9 @@ pub enum BitOrder
 //     println("${bitstream.order_code(BitsLsbFirst)}")   // 0
 // ```
 pub fn order_code(o: BitOrder) -> Int
-    todo("bitstream.order_code")
+    match o
+        BitsLsbFirst => bitstream_core.lsb_first()
+        BitsMsbFirst => bitstream_core.msb_first()
 
 // What went wrong reading or writing bits.
 //
@@ -68,7 +62,7 @@ pub fn order_code(o: BitOrder) -> Int
 // more bits than it supplied.
 //
 // The names are prefixed because a variant is constructed by name
-// across the whole assembly, and `Exhausted` is the name every codec
+// across the whole program, and `Exhausted` is the name every codec
 // wants.
 pub enum BitError
     // `n` was outside `1 ..= 64`.  Zero bits is not a read — a caller
@@ -94,7 +88,10 @@ impl Error for BitError
     // offset.  The offset is in the text rather than left for the
     // caller to add, because a bit stream has no other landmark.
     fn message(self) -> Str
-        todo("bitstream.BitError.message")
+        match self
+            BitsWidthOutOfRange(n)     => "bitstream: a width of ${n} bits is outside 1 to 64"
+            BitsExhausted(at, need)    => "bitstream: ${need} bits wanted at bit ${at}, and fewer are left"
+            BitsValueTooWide(value, n) => "bitstream: ${value} does not fit in ${n} bits"
 
 // A bit reader over bytes the caller already holds.
 //
@@ -120,7 +117,7 @@ pub struct BitReader
 //     println("${bitstream.bits_left(r)}")   // 8
 // ```
 pub fn reader(src: Bytes, order: BitOrder) -> BitReader
-    todo("bitstream.reader")
+    BitReader { src: src, at: 0, order: order_code(order), hold: 0, count: 0 }
 
 // A read that succeeded: the reader after it, and the value.
 //
@@ -139,7 +136,7 @@ pub struct BitRead
 // in, so a read of 3 answers `0 ..= 7` and the caller's arithmetic does
 // not change with the format.
 //
-// A read of 64 whose top bit is set answers a NEGATIVE `Int`: the value
+// A read of 64 whose top bit is set answers a negative `Int`: the value
 // travels in a signed 64-bit integer and that is the bit pattern.  A
 // caller who wants the unsigned reading reads 32 and 32.
 //
@@ -155,7 +152,18 @@ pub struct BitRead
 //         Err(e) => println(e.message())
 // ```
 pub fn read(r: BitReader, n: Int) -> Result<BitRead, BitError>
-    todo("bitstream.read")
+    if n > 56 and n <= bitstream_core.max_bits() and n <= bits_left(r)
+        // The accumulator holds 64 bits and is refilled a byte at a
+        // time, so at an offset that is not a byte boundary it holds
+        // fewer.  Any read of 56 bits or less fits at every offset, and
+        // a wider one is two reads.
+        let first = read(r, 32)!
+        let second = read(first.reader, n - 32)!
+        return Ok(BitRead { reader: second.reader,
+                            value: joined(r.order, first.value, second.value, n - 32) })
+    let a = filled(r, n)!
+    let t = bitstream_core.take(a, n)
+    Ok(BitRead { reader: with_acc(r, t.acc, a.count - r.count), value: t.value })
 
 // Look at the next `n` bits without consuming them.
 //
@@ -164,7 +172,7 @@ pub fn read(r: BitReader, n: Int) -> Result<BitRead, BitError>
 // decoder written with `read` alone has to put bits back, and a bit
 // stream has no way to put bits back.
 pub fn peek(r: BitReader, n: Int) -> Result<Int, BitError>
-    todo("bitstream.peek")
+    Ok(read(r, n)!.value)
 
 // Drop the next `n` bits and answer the reader after them.
 //
@@ -172,7 +180,7 @@ pub fn peek(r: BitReader, n: Int) -> Result<Int, BitError>
 // skipping a longer run calls it more than once, which is what a bit
 // stream costs.
 pub fn skip(r: BitReader, n: Int) -> Result<BitReader, BitError>
-    todo("bitstream.skip")
+    Ok(read(r, n)!.reader)
 
 // Advance to the next byte boundary, discarding up to seven bits.
 //
@@ -181,7 +189,7 @@ pub fn skip(r: BitReader, n: Int) -> Result<BitReader, BitError>
 // stored block starts here, and so does every format whose header ends
 // on a boundary.
 pub fn align(r: BitReader) -> BitReader
-    todo("bitstream.align")
+    with_acc(r, bitstream_core.align(reader_acc(r)), 0)
 
 // How many bits of `src` the reader has consumed, counted from bit
 // zero.
@@ -189,14 +197,14 @@ pub fn align(r: BitReader) -> BitReader
 // The only position a bit stream has.  A caller that needs a byte
 // offset divides by eight and checks `to_align` for the remainder.
 pub fn bit_pos(r: BitReader) -> Int
-    todo("bitstream.bit_pos")
+    r.at * 8 - r.count
 
 // How many bits of `src` are left: the buffered bits plus eight per
 // byte not yet pulled in.
 //
 // What a caller checks before a read it cannot afford to have refused.
 pub fn bits_left(r: BitReader) -> Int
-    todo("bitstream.bits_left")
+    r.count + 8 * (bytes.len(r.src) - r.at)
 
 // How many bits stand between the reader and the next byte boundary,
 // `0 ..= 7`.
@@ -205,7 +213,7 @@ pub fn bits_left(r: BitReader) -> Int
 // to know whether it is already on one — a stored block's header asks
 // exactly this — reads the number.
 pub fn to_align(r: BitReader) -> Int
-    todo("bitstream.to_align")
+    bitstream_core.to_align(reader_acc(r))
 
 // A bit writer accumulating bytes.
 //
@@ -216,8 +224,11 @@ pub fn to_align(r: BitReader) -> Int
 // header, and `count` never exceeds seven: every write emits the whole
 // bytes it completed.
 //
-// A caller who cannot afford the list writes with `bitstream_core`
-// instead, which emits into a fixed inline array and allocates nothing.
+// A write that completes a byte copies the list, so the writer passed
+// in keeps its bytes and a long stream costs time in proportion to the
+// square of its length.  A caller writing a long stream, or one that
+// cannot allocate, writes with `bitstream_core` instead, which emits
+// into a fixed inline array.
 pub struct BitWriter
     out: [Int]
     order: Int
@@ -226,7 +237,7 @@ pub struct BitWriter
 
 // A writer in `order`, with nothing in it.
 pub fn writer(order: BitOrder) -> BitWriter
-    todo("bitstream.writer")
+    BitWriter { out: [], order: order_code(order), hold: 0, count: 0 }
 
 // Write the low `n` bits of `value`, `1 ..= 64`.
 //
@@ -243,7 +254,12 @@ pub fn writer(order: BitOrder) -> BitWriter
 //         Err(e) => println(e.message())
 // ```
 pub fn write(w: BitWriter, value: Int, n: Int) -> Result<BitWriter, BitError>
-    todo("bitstream.write")
+    if n < 1 or n > bitstream_core.max_bits()
+        return Err(BitsWidthOutOfRange(n))
+    let e = bitstream_core.put(writer_sink(w), value, n)
+    if not e.ok
+        return Err(BitsValueTooWide(value, n))
+    Ok(drained(w, e))
 
 // Pad to the next byte boundary with zero bits.
 //
@@ -251,14 +267,14 @@ pub fn write(w: BitWriter, value: Int, n: Int) -> Result<BitWriter, BitError>
 // that is what DEFLATE's final block and every other aligned format
 // specify; a format that pads with ones writes them with `write` first.
 pub fn write_align(w: BitWriter) -> BitWriter
-    todo("bitstream.write_align")
+    drained(w, bitstream_core.flush(writer_sink(w)))
 
 // How many bits the writer has taken, counted from bit zero.
 //
 // Not the same as eight times the byte count: a writer three bits in
 // has written no byte at all, and this is what says so.
 pub fn writer_bits(w: BitWriter) -> Int
-    todo("bitstream.writer_bits")
+    w.out.len() * 8 + w.count
 
 // The bytes the writer has completed.
 //
@@ -267,7 +283,10 @@ pub fn writer_bits(w: BitWriter) -> Int
 // finished with a half byte in it is a caller that forgot the padding,
 // and answering seven bits as eight would hide that.
 pub fn writer_bytes(w: BitWriter) -> Bytes
-    todo("bitstream.writer_bytes")
+    var b = bytes.zeros(w.out.len())
+    for i in 0..w.out.len()
+        b = bytes.set_u8(b, i, w.out[i])
+    b
 
 // ── The handoff to the device half ──────────────────────────────────
 
@@ -280,7 +299,7 @@ pub fn writer_bytes(w: BitWriter) -> Bytes
 // split, and this is the state that would otherwise be trapped on this
 // side of it.
 pub fn reader_acc(r: BitReader) -> BitAcc
-    todo("bitstream.reader_acc")
+    BitAcc { order: r.order, hold: r.hold, count: r.count }
 
 // The writer's sink, as `bitstream_core` holds it.
 //
@@ -288,4 +307,43 @@ pub fn reader_acc(r: BitReader) -> BitAcc
 // header hands the sink to an encoder that emits into an inline array
 // instead of growing a list.
 pub fn writer_sink(w: BitWriter) -> BitSink
-    todo("bitstream.writer_sink")
+    BitSink { order: w.order, hold: w.hold, count: w.count }
+
+// The reader's accumulator after pulling in as few bytes as a read of
+// `n` bits needs, or the refusal that read earns.
+fn filled(r: BitReader, n: Int) -> Result<BitAcc, BitError>
+    if n < 1 or n > bitstream_core.max_bits()
+        return Err(BitsWidthOutOfRange(n))
+    if n > bits_left(r)
+        return Err(BitsExhausted(bit_pos(r), n))
+    var a = reader_acc(r)
+    var at = r.at
+    while a.count < n
+        a = bitstream_core.feed(a, (bytes.byte_at(r.src, at) ?? 0) as u8)
+        at = at + 1
+    Ok(a)
+
+// Two consecutive reads of 32 and `rest` bits as one value, in the
+// stream's order: the first read is the low part LSB-first and the high
+// part MSB-first.
+fn joined(order: Int, first: Int, second: Int, rest: Int) -> Int
+    if order == bitstream_core.lsb_first()
+        return first | (second << 32)
+    (first << rest) | second
+
+// `r` with the accumulator `a`, after `pulled` bits were fed into it
+// from `src`.
+fn with_acc(r: BitReader, a: BitAcc, pulled: Int) -> BitReader
+    BitReader { src: r.src, at: r.at + pulled / 8, order: a.order, hold: a.hold, count: a.count }
+
+// `w` with the bytes `e` completed appended and its sink taken over.
+//
+// The list is copied when a byte completes, so the writer the caller
+// passed in keeps the bytes it had.
+fn drained(w: BitWriter, e: BitEmit) -> BitWriter
+    if e.len == 0
+        return BitWriter { out: w.out, order: e.sink.order, hold: e.sink.hold, count: e.sink.count }
+    var out = w.out[:]
+    for k in 0..e.len
+        list.push(out, e.out[k] as Int)
+    BitWriter { out: out, order: e.sink.order, hold: e.sink.hold, count: e.sink.count }

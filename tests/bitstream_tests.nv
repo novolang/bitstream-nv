@@ -1,24 +1,16 @@
-// tests/bitstream_tests.nv — the API tests, written against the
-// signatures.
+// tests/bitstream_tests.nv — hand-worked bit patterns in both orders,
+// and round trips.
 //
-// They COMPILE today and they FAIL at run, with `not implemented:
-// bitstream.<fn>` from the `todo()` that is each body.  That is the
-// expected state of an interface release: the compiler has checked
-// every signature, every type and every effect row, and nothing else
-// has been checked because there is nothing else yet.
-//
-// WHERE THE VECTORS COME FROM.  A bit stream has no specification of
-// its own — it is the substrate the specifications are written on — so
-// the vectors here are taken from the formats that read one:
+// A bit stream has no specification of its own: it is the substrate
+// the specifications are written on.  The vectors are taken from the
+// formats that read one:
 //
 //   * RFC 1951 § 3.1.1 fixes DEFLATE's LSB-first packing, and § 3.2.3
 //     the three-bit block header that is the first thing any inflater
 //     reads;
-//   * RFC 1951 § 3.1.1 also fixes the exception — Huffman codes are
-//     packed MSB-first inside an otherwise LSB-first stream;
-//   * ITU-T T.81 (JPEG) § F.1.2.1 fixes the MSB-first entropy-coded
-//     segment, which is what every other reader in the world does;
-//   * RFC 2083 § 7.2 (PNG) fixes the MSB-first ordering of sub-byte
+//   * ITU-T T.81 (JPEG) Annex F fixes the MSB-first entropy-coded
+//     segment;
+//   * RFC 2083 (PNG) § 7.2 fixes the MSB-first ordering of sub-byte
 //     pixel rows.
 //
 // A hand-worked byte accompanies each, so a reader can check the
@@ -334,3 +326,241 @@ fn test_the_host_writer_hands_its_sink_to_the_device_half()
         Ok(w)  =>
             let s = bitstream.writer_sink(w)
             test.assert_eq(bitstream_core.sink_bits(s), 3)
+
+// ── Longer patterns, worked by hand, and round trips ────────────────
+
+// Ten fields of 1 to 36 bits, 111 bits in all: every width class a
+// codec writes, and fields that straddle two, three and five bytes.
+fn fields() -> [(Int, Int)]
+    [(1, 1), (2, 2), (5, 3), (0x1ff, 9), (0, 2), (0xabcdef, 24), (3, 2),
+     (0x7fffffff, 31), (1, 1), (0x123456789, 36)]
+
+// The ten fields written in `order` and padded to a byte.
+fn written(order: BitOrder) -> Bytes
+    var w = bitstream.writer(order)
+    for f in fields()
+        let (v, n) = f
+        match bitstream.write(w, v, n)
+            Ok(next) =>
+                w = next
+            Err(e)   => test.fail(e.message())
+    bitstream.writer_bytes(bitstream.write_align(w))
+
+@test
+fn test_ten_fields_pack_lsb_first_to_the_hand_worked_bytes()
+    // The first byte, low bit first: 1 | 0,1 | 1,0,1 | 1,1 — the value
+    // 1 + 4 + 8 + 32 + 64 + 128 = 237 = 0xed.  Seven more bits of 0x1ff
+    // make 0x7f, and so on; the fourteenth byte holds the last seven
+    // bits of 0x123456789 and one bit of padding.
+    test.assert_eq(bytes.to_hex(written(BitsLsbFirst)), "ed7fde9b57ffffffff4f3c2b1a09")
+
+@test
+fn test_ten_fields_pack_msb_first_to_the_hand_worked_bytes()
+    // The first byte, high bit first: 1 | 1,0 | 1,0,1 | 1,1 — the value
+    // 0b11010111 = 0xd7.
+    test.assert_eq(bytes.to_hex(written(BitsMsbFirst)), "d7fe55e6f7ffffffffe2468acf12")
+
+fn assert_reads_back(order: BitOrder)
+    var r = bitstream.reader(written(order), order)
+    for f in fields()
+        let (v, n) = f
+        match bitstream.read(r, n)
+            Ok(got) =>
+                test.assert_eq(got.value, v)
+                r = got.reader
+            Err(e)  => test.fail(e.message())
+    // 111 bits read, one bit of padding left.
+    test.assert_eq(bitstream.bit_pos(r), 111)
+    test.assert_eq(bitstream.bits_left(r), 1)
+    test.assert_eq(bitstream.to_align(r), 1)
+
+@test
+fn test_the_ten_fields_read_back_in_both_orders()
+    assert_reads_back(BitsLsbFirst)
+    assert_reads_back(BitsMsbFirst)
+
+@test
+fn test_a_sixty_four_bit_field_round_trips_and_reads_as_its_bit_pattern()
+    // A 64-bit value with the top bit set is a negative Int; that is the
+    // bit pattern, and it comes back as it went in.
+    let v = 0x8123456789abcdef
+    for order in [BitsLsbFirst, BitsMsbFirst]
+        // Three bits first, so the 64-bit field straddles nine bytes.
+        match bitstream.write(bitstream.writer(order), 5, 3)
+            Err(e) => test.fail(e.message())
+            Ok(w)  =>
+                match bitstream.write(w, v, 64)
+                    Err(e) => test.fail(e.message())
+                    Ok(w2) =>
+                        let b = bitstream.writer_bytes(bitstream.write_align(w2))
+                        test.assert_eq(bytes.len(b), 9)
+                        let r = bitstream.reader(b, order)
+                        match bitstream.skip(r, 3)
+                            Err(e) => test.fail(e.message())
+                            Ok(r2) =>
+                                match bitstream.read(r2, 64)
+                                    Ok(got) => test.assert_eq(got.value, v)
+                                    Err(e)  => test.fail(e.message())
+
+@test
+fn test_sixty_four_bits_msb_first_are_the_bytes_in_order()
+    let r = bitstream.reader(hex("0123456789abcdef"), BitsMsbFirst)
+    match bitstream.read(r, 64)
+        Ok(v)  => test.assert_eq(v.value, 0x0123456789abcdef)
+        Err(e) => test.fail(e.message())
+    // LSB-first the same eight bytes are the little-endian number.
+    let l = bitstream.reader(hex("0123456789abcdef"), BitsLsbFirst)
+    match bitstream.read(l, 64)
+        Ok(v)  => test.assert_eq(v.value, 0xefcdab8967452301)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_png_one_bit_pixels_are_msb_first()
+    // RFC 2083 § 7.2: pixels narrower than a byte are packed with the
+    // leftmost pixel in the high-order bits.  0xb0 is 1011 0000:
+    // pixels 1, 0, 1, 1, 0.
+    var r = bitstream.reader(hex("b0"), BitsMsbFirst)
+    for want in [1, 0, 1, 1, 0]
+        match bitstream.read(r, 1)
+            Ok(v)  =>
+                test.assert_eq(v.value, want)
+                r = v.reader
+            Err(e) => test.fail(e.message())
+
+// ── Refusals and messages ───────────────────────────────────────────
+
+@test
+fn test_every_read_refuses_the_same_way()
+    let r = bitstream.reader(hex("ab"), BitsMsbFirst)
+    match bitstream.peek(r, 9)
+        Ok(_)  => test.fail("nine bits of one byte")
+        Err(e) => test.assert_eq(e.message(), "bitstream: 9 bits wanted at bit 0, and fewer are left")
+    match bitstream.skip(r, 0)
+        Ok(_)  => test.fail("a zero-bit skip")
+        Err(e) => test.assert_eq(e.message(), "bitstream: a width of 0 bits is outside 1 to 64")
+    match bitstream.read(r, 5)
+        Err(e) => test.fail(e.message())
+        Ok(v)  =>
+            match bitstream.read(v.reader, 4)
+                Ok(_)  => test.fail("four bits of three")
+                Err(e) =>
+                    match e
+                        BitsExhausted(at, need) =>
+                            test.assert_eq(at, 5)
+                            test.assert_eq(need, 4)
+                        _                       => test.fail(e.message())
+
+@test
+fn test_every_write_refuses_the_same_way()
+    let w = bitstream.writer(BitsLsbFirst)
+    match bitstream.write(w, 1, 0)
+        Ok(_)  => test.fail("a zero-bit write")
+        Err(e) => test.assert_eq(e.message(), "bitstream: a width of 0 bits is outside 1 to 64")
+    match bitstream.write(w, 1, 65)
+        Ok(_)  => test.fail("a 65-bit write")
+        Err(e) => test.assert_eq(kind(e), "width")
+    match bitstream.write(w, -1, 8)
+        Ok(_)  => test.fail("-1 does not fit eight bits")
+        Err(e) => test.assert_eq(e.message(), "bitstream: -1 does not fit in 8 bits")
+    // Every bit pattern fits sixty-four bits, -1 included.
+    match bitstream.write(w, -1, 64)
+        Ok(w2) => test.assert_eq(bytes.to_hex(bitstream.writer_bytes(w2)), "ffffffffffffffff")
+        Err(e) => test.fail(e.message())
+
+fn kind(e: BitError) -> Str
+    match e
+        BitsWidthOutOfRange(_) => "width"
+        BitsExhausted(_, _)    => "exhausted"
+        BitsValueTooWide(_, _) => "wide"
+
+@test
+fn test_a_writer_passed_on_keeps_its_own_bytes()
+    // The writer is a value the caller threads through; the one it
+    // passed in still answers what it held.
+    match bitstream.write(bitstream.writer(BitsMsbFirst), 0x45, 8)
+        Err(e) => test.fail(e.message())
+        Ok(w)  =>
+            match bitstream.write(w, 0x00, 8)
+                Err(e) => test.fail(e.message())
+                Ok(w2) =>
+                    test.assert_eq(bytes.to_hex(bitstream.writer_bytes(w)), "45")
+                    test.assert_eq(bytes.to_hex(bitstream.writer_bytes(w2)), "4500")
+
+@test
+fn test_align_on_a_boundary_moves_nothing()
+    let r = bitstream.reader(hex("abcd"), BitsLsbFirst)
+    test.assert_eq(bitstream.bit_pos(bitstream.align(r)), 0)
+    let w = bitstream.write_align(bitstream.writer(BitsLsbFirst))
+    test.assert_eq(bitstream.writer_bits(w), 0)
+
+// ── The device half at its limits ───────────────────────────────────
+
+@test
+fn test_the_accumulator_holds_sixty_four_bits_and_refuses_a_ninth_byte()
+    for order in [bitstream_core.lsb_first(), bitstream_core.msb_first()]
+        var a = bitstream_core.acc_lsb()
+        if order == bitstream_core.msb_first()
+            a = bitstream_core.acc_msb()
+        for i in 0..8
+            a = bitstream_core.feed(a, (i + 1) as u8)
+        test.assert_eq(bitstream_core.acc_room(a), 0)
+        // No room: the byte is dropped and the accumulator unchanged.
+        let full = bitstream_core.feed(a, 0xff as u8)
+        test.assert_eq(full.count, 64)
+        test.assert_eq(full.hold, a.hold)
+        let all = bitstream_core.take(a, 64)
+        test.assert_true(all.ok, "sixty-four bits came out")
+        if order == bitstream_core.lsb_first()
+            test.assert_eq(all.value, 0x0807060504030201)
+        else
+            test.assert_eq(all.value, 0x0102030405060708)
+        test.assert_eq(bitstream_core.acc_bits(all.acc), 0)
+
+@test
+fn test_the_accumulator_refuses_a_width_outside_one_to_sixty_four()
+    let a = bitstream_core.feed(bitstream_core.acc_lsb(), 1 as u8)
+    test.assert_true(not bitstream_core.take(a, 0).ok, "zero bits")
+    test.assert_true(not bitstream_core.peek(a, 65).ok, "sixty-five bits")
+    test.assert_true(not bitstream_core.skip(a, 9).ok, "nine of eight")
+    test.assert_eq(bitstream_core.align(a).count, 8)
+
+@test
+fn test_msb_first_takes_come_from_the_top_of_the_live_bits()
+    // 0xAB then 0xCD, MSB-first: 1010 1011 1100 1101.  Four bits are
+    // 1010 = 10, then twelve are 1011 1100 1101 = 0xbcd.
+    var a = bitstream_core.feed(bitstream_core.acc_msb(), 0xAB as u8)
+    a = bitstream_core.feed(a, 0xCD as u8)
+    let four = bitstream_core.take(a, 4)
+    test.assert_eq(four.value, 10)
+    test.assert_eq(bitstream_core.peek(four.acc, 12).value, 0xbcd)
+    let aligned = bitstream_core.align(four.acc)
+    test.assert_eq(bitstream_core.take(aligned, 8).value, 0xCD)
+
+@test
+fn test_a_sixty_four_bit_put_behind_seven_pending_bits_completes_eight_bytes()
+    // Seven plus sixty-four is seventy-one: eight whole bytes and seven
+    // bits left over, the most one put can produce.
+    let seven = bitstream_core.put(bitstream_core.sink_lsb(), 0x7f, 7)
+    let e = bitstream_core.put(seven.sink, -1, 64)
+    test.assert_true(e.ok, "sixty-four bits went in")
+    test.assert_eq(e.len, 8)
+    for k in 0..8
+        test.assert_eq(e.out[k] as Int, 0xff)
+    test.assert_eq(bitstream_core.sink_bits(e.sink), 7)
+    let last = bitstream_core.flush(e.sink)
+    test.assert_eq(last.out[0] as Int, 0x7f)
+
+    // MSB-first the same put: the first byte is the seven pending bits
+    // 0000001 and the top bit of the value, 1.
+    let m7 = bitstream_core.put(bitstream_core.sink_msb(), 1, 7)
+    let m = bitstream_core.put(m7.sink, 0x0123456789abcdef, 64)
+    test.assert_eq(m.len, 8)
+    test.assert_eq(m.out[0] as Int, 0x02)
+    test.assert_eq(m.out[1] as Int, 0x02)
+    test.assert_eq(m.out[7] as Int, 0x9b)
+    test.assert_eq(bitstream_core.flush(m.sink).out[0] as Int, 0xde)
+
+@test
+fn test_a_sink_refuses_a_width_outside_one_to_sixty_four()
+    test.assert_true(not bitstream_core.put(bitstream_core.sink_msb(), 0, 0).ok, "zero bits")
+    test.assert_true(not bitstream_core.put(bitstream_core.sink_msb(), 0, 65).ok, "sixty-five bits")

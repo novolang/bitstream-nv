@@ -2,41 +2,33 @@
 // allocates nothing, holds no buffer, and builds for a
 // microcontroller.
 //
-// Every body is a `todo()`.  The signatures are the design, and the
-// compiler checks them as claims; see the README for the stamp.
+// The package has a second module because `bitstream` speaks `Bytes`,
+// and the embedded runtime defines no `novo_bytes_*` symbol.  A device
+// that called one would fail at the linker rather than at the type
+// checker, and one host-only function anywhere in a compilation unit is
+// an undefined symbol on a device whether or not the firmware calls it.
+// The half a device uses is therefore its own module, and it takes and
+// returns integers.
 //
-// WHY THERE IS A SECOND MODULE.  `bitstream` speaks `Bytes`, and
-// `Bytes` does not link at the embedded tier: the embedded runtime
-// defines no `novo_bytes_*` symbol, so a device that called one would
-// fail at the linker rather than at the type checker.  One host-only
-// function anywhere in a compilation unit is an undefined symbol on a
-// device whether or not the firmware calls it, so the half a device
-// uses is its own module and takes and returns integers.
-//
-// THE STATE IS TWO INTEGERS AND A FLAG.  `hold` is the live bits,
+// The state is two integers and an order.  `hold` is the live bits,
 // `count` is how many of them are live, and `order` says which end of
-// `hold` the next bits come out of.  That is the whole of a DEFLATE
-// decoder's bit machinery, and the whole of a JPEG decoder's, and the
-// difference between the two is the third field.
+// the stream's bytes the next bits come out of.  DEFLATE fills from the
+// least significant end of each byte (RFC 1951 § 3.1.1), and JPEG
+// (ITU-T T.81 Annex F), PNG's sub-byte pixel rows and the bit-numbered
+// field diagrams of most RFCs fill from the most significant end.
 //
-// WHICH ORDER A FORMAT WANTS is a fact a reader of this package is
-// looking for, so it is in the README as a table rather than only here:
-// DEFLATE, zlib and gzip fill from the LSB end; JPEG, PNG's optional
-// bit-packed rows, CBOR's and MessagePack's sub-byte heads, Huffman
-// tables in general, and every network protocol that draws its fields
-// left to right fill from the MSB end.
+// The order is a field fixed at the constructor rather than a choice
+// made per call.  A stream is one order from end to end, and a stream
+// read in the wrong order does not fail: it answers plausible numbers.
+// The field is an `Int` because a `@value` struct holds integers, and a
+// fieldless enum is still a tagged value.
 //
-// WHY THE ORDER IS A FIELD AND NOT TWO FUNCTION FAMILIES.  A stream is
-// one order from end to end, so the choice is made once, at the
-// constructor, and every later call reads it off the value.  Two
-// families would let a caller feed LSB-first and take MSB-first with no
-// diagnostic, and the resulting corruption looks like a bad payload
-// rather than like a bug.  An `Int` field is also the only shape that
-// survives `@value`: a fieldless enum is still a tagged value, and a
-// `@value` struct holds integers.
+// Every function here carries `@tier(embedded)`, so a `Str`, a list
+// literal or an unbounded loop written below is refused where it is
+// written.
 
-// The LSB-first order: the next bits come out of the LOW end of the
-// accumulator, and a fed byte goes on ABOVE what is already there.
+// The LSB-first order: the next bits come out of the low end of the
+// accumulator, and a fed byte goes on above what is already there.
 //
 // This is DEFLATE's order (RFC 1951 § 3.1.1): "Data elements other than
 // Huffman codes are packed starting with the least-significant bit of
@@ -48,39 +40,47 @@
 // fn main() [io]
 //     println("${bitstream_core.lsb_first()}")   // 0
 // ```
-pub fn lsb_first() -> Int
-    todo("bitstream_core.lsb_first")
+pub @tier(embedded)
+fn lsb_first() -> Int
+    0
 
-// The MSB-first order: the next bits come out of the HIGH end of the
-// live window, which is the order a value written left to right is read
+// The MSB-first order: the next bits come out of the high end of the
+// live bits, which is the order a value written left to right is read
 // back in.
 //
-// This is what almost everything that is not DEFLATE uses — JPEG's
-// entropy-coded segments, PNG's bit-packed rows, the sub-byte header
-// fields of CBOR and MessagePack, and the bit-numbered field diagrams
-// in every RFC that draws one.  It is also, confusingly, the order
-// DEFLATE's HUFFMAN CODES are packed in even though its other elements
-// are LSB-first; the README has that paragraph.
-pub fn msb_first() -> Int
-    todo("bitstream_core.msb_first")
+// JPEG's entropy-coded segments, PNG's bit-packed rows, the sub-byte
+// header fields of CBOR and MessagePack, and the bit-numbered field
+// diagrams of most RFCs use this order.  DEFLATE's Huffman codes are
+// also written most significant bit first, inside a stream that is
+// otherwise LSB-first (RFC 1951 § 3.1.1); the README has that
+// paragraph.
+pub @tier(embedded)
+fn msb_first() -> Int
+    1
 
 // The most bits one `take` or one `put` may ask for: 64.
 //
-// The value travels in an `Int`, which is 64 bits wide and SIGNED, so a
+// The value travels in an `Int`, which is 64 bits wide and signed, so a
 // take of 64 whose top bit is set answers a negative number.  That is
-// the bit pattern and not a fault — the README says so where a caller
-// will look for it — and a caller who wants the unsigned reading takes
-// 32 and 32.
-pub fn max_bits() -> Int
-    todo("bitstream_core.max_bits")
+// the bit pattern and not a fault.  A caller who wants the unsigned
+// reading takes 32 and 32.
+//
+// An accumulator is refilled a byte at a time, so at an offset that is
+// not a byte boundary it holds at most 64 bits less the bits already
+// taken from the current byte.  A caller reading a field that wide
+// there takes it in two parts, as `bitstream.read` does.
+pub @tier(embedded)
+fn max_bits() -> Int
+    64
 
 // How many bits an accumulator can hold at once: 64.
 //
 // `feed` needs eight of them free, so a caller refills while
 // `acc_room` is at least 8 and takes while `acc_bits` is at least what
 // it wants.  That two-line loop is the whole protocol.
-pub fn capacity() -> Int
-    todo("bitstream_core.capacity")
+pub @tier(embedded)
+fn capacity() -> Int
+    64
 
 // The bits a reader has buffered and not yet handed out.
 //
@@ -88,9 +88,9 @@ pub fn capacity() -> Int
 // header, no reference count and no allocation.  A DEFLATE inner loop
 // that owns one owns twenty-four bytes of its own frame.
 //
-// `hold` is the live bits, right-aligned under LSB-first and
-// left-aligned within the live window under MSB-first; `count` is how
-// many of them are live, `0 ..= 64`; `order` is `lsb_first()` or
+// `hold` is the live bits in its low `count` places.  Under LSB-first
+// the next bit out is the lowest; under MSB-first it is the highest of
+// the `count`.  `count` is `0 ..= 64`, and `order` is `lsb_first()` or
 // `msb_first()` and never changes after the constructor.
 pub @value
 struct BitAcc
@@ -107,31 +107,35 @@ struct BitAcc
 //     let a = bitstream_core.acc_lsb()
 //     println("${a.count}")   // 0
 // ```
-pub fn acc_lsb() -> BitAcc
-    todo("bitstream_core.acc_lsb")
+pub @tier(embedded)
+fn acc_lsb() -> BitAcc
+    BitAcc { order: 0, hold: 0, count: 0 }
 
 // A fresh MSB-first accumulator, empty.
-pub fn acc_msb() -> BitAcc
-    todo("bitstream_core.acc_msb")
+pub @tier(embedded)
+fn acc_msb() -> BitAcc
+    BitAcc { order: 1, hold: 0, count: 0 }
 
 // How many bits are live in `a` — the "remaining" count a caller checks
 // before taking.
-pub fn acc_bits(a: BitAcc) -> Int
-    todo("bitstream_core.acc_bits")
+pub @tier(embedded)
+fn acc_bits(a: BitAcc) -> Int
+    a.count
 
 // How many more bits `a` has room for: `capacity() - acc_bits(a)`.
 //
 // `feed` is safe exactly while this is 8 or more, and answering it
 // rather than refusing inside `feed` is what lets a caller write the
 // refill as a `while`.
-pub fn acc_room(a: BitAcc) -> Int
-    todo("bitstream_core.acc_room")
+pub @tier(embedded)
+fn acc_room(a: BitAcc) -> Int
+    capacity() - a.count
 
 // Add one byte to the accumulator, in the order `a` was built with.
 //
-// Under `lsb_first` the byte lands ABOVE the live bits, so the bits
-// already there stay next in line.  Under `msb_first` it lands BELOW
-// them, for the same reason: the oldest bit is always the next one out.
+// Under `lsb_first` the byte lands above the live bits, and under
+// `msb_first` below them.  Either way the oldest bit is the next one
+// out.
 //
 // A byte fed with fewer than 8 bits of room is dropped and `a` comes
 // back unchanged, because a `@value` function has nowhere to put a
@@ -144,21 +148,24 @@ pub fn acc_room(a: BitAcc) -> Int
 //     let a = bitstream_core.feed(bitstream_core.acc_lsb(), 0xAB as u8)
 //     println("${a.count}")   // 8
 // ```
-pub fn feed(a: BitAcc, b: u8) -> BitAcc
-    todo("bitstream_core.feed")
+pub @tier(embedded)
+fn feed(a: BitAcc, b: u8) -> BitAcc
+    if acc_room(a) < 8
+        return a
+    let v = b as Int
+    if a.order == 0
+        return BitAcc { order: 0, hold: a.hold | (v << a.count), count: a.count + 8 }
+    BitAcc { order: a.order, hold: (a.hold << 8) | v, count: a.count + 8 }
 
 // What one read produced: the accumulator after it, the value, and
 // whether it happened at all.
 //
 // `ok` is false when the accumulator held fewer than `n` bits, or when
 // `n` was outside `1 ..= max_bits()`; `acc` then comes back unchanged
-// and `value` is 0.  A `Result` would be the shape everywhere else in
-// this package, and it is not the shape here: a `@value` struct cannot
-// be a `Result` payload, and a bit reader that allocated to report a
-// refill boundary would allocate once per byte of a compressed stream.
-//
-// So this is the one place the package answers a flag instead of a
-// value, and it is the price of the device claim.
+// and `value` is 0.  The answer is a flag rather than a `Result`
+// because a `@value` struct cannot be a `Result` payload, and a bit
+// reader that allocated to report a refill boundary would allocate once
+// per byte of a compressed stream.
 pub @value
 struct BitTake
     acc: BitAcc
@@ -183,8 +190,11 @@ struct BitTake
 //     let t = bitstream_core.take(a, 3)
 //     println("${t.value} ${t.acc.count}")   // 3 5
 // ```
-pub fn take(a: BitAcc, n: Int) -> BitTake
-    todo("bitstream_core.take")
+pub @tier(embedded)
+fn take(a: BitAcc, n: Int) -> BitTake
+    if n < 1 or n > max_bits() or n > a.count
+        return BitTake { acc: a, value: 0, ok: false }
+    BitTake { acc: after(a, n), value: next_bits(a, n), ok: true }
 
 // Look at the next `n` bits without consuming them: `acc` comes back
 // unchanged and `value` is what `take` would have answered.
@@ -193,15 +203,21 @@ pub fn take(a: BitAcc, n: Int) -> BitTake
 // holds, look it up, then skip exactly the length the table says — and
 // it is why `peek` and `skip` are separate calls rather than a `take`
 // that guesses.
-pub fn peek(a: BitAcc, n: Int) -> BitTake
-    todo("bitstream_core.peek")
+pub @tier(embedded)
+fn peek(a: BitAcc, n: Int) -> BitTake
+    if n < 1 or n > max_bits() or n > a.count
+        return BitTake { acc: a, value: 0, ok: false }
+    BitTake { acc: a, value: next_bits(a, n), ok: true }
 
 // Drop the next `n` bits and answer the accumulator after them.
 // `value` is 0; `ok` follows the same rule as `take`.
 //
 // The other half of the Huffman pair above.
-pub fn skip(a: BitAcc, n: Int) -> BitTake
-    todo("bitstream_core.skip")
+pub @tier(embedded)
+fn skip(a: BitAcc, n: Int) -> BitTake
+    if n < 1 or n > max_bits() or n > a.count
+        return BitTake { acc: a, value: 0, ok: false }
+    BitTake { acc: after(a, n), value: 0, ok: true }
 
 // How many bits stand between `a` and the next byte boundary of the
 // stream it is reading: `acc_bits(a) % 8`.
@@ -209,8 +225,9 @@ pub fn skip(a: BitAcc, n: Int) -> BitTake
 // A caller that wants the boundary calls `align`; a caller that wants
 // to know whether it is already there — DEFLATE's stored block asks
 // exactly this — reads the number.
-pub fn to_align(a: BitAcc) -> Int
-    todo("bitstream_core.to_align")
+pub @tier(embedded)
+fn to_align(a: BitAcc) -> Int
+    a.count % 8
 
 // Drop bits up to the next byte boundary and answer the accumulator
 // there.
@@ -218,8 +235,12 @@ pub fn to_align(a: BitAcc) -> Int
 // Always succeeds: aligning an already-aligned accumulator drops
 // nothing.  DEFLATE's stored block begins with this, and so does every
 // format whose header ends on a boundary it did not write padding for.
-pub fn align(a: BitAcc) -> BitAcc
-    todo("bitstream_core.align")
+pub @tier(embedded)
+fn align(a: BitAcc) -> BitAcc
+    let n = to_align(a)
+    if n == 0
+        return a
+    after(a, n)
 
 // The bits a writer has accumulated and not yet emitted as whole
 // bytes — the reader's mirror, and the same two integers and a flag.
@@ -234,19 +255,22 @@ struct BitSink
     count: Int
 
 // A fresh LSB-first sink, empty.  The order a DEFLATE encoder wants.
-pub fn sink_lsb() -> BitSink
-    todo("bitstream_core.sink_lsb")
+pub @tier(embedded)
+fn sink_lsb() -> BitSink
+    BitSink { order: 0, hold: 0, count: 0 }
 
 // A fresh MSB-first sink, empty.
-pub fn sink_msb() -> BitSink
-    todo("bitstream_core.sink_msb")
+pub @tier(embedded)
+fn sink_msb() -> BitSink
+    BitSink { order: 1, hold: 0, count: 0 }
 
 // How many bits `s` holds that are not yet a whole byte, `0 ..= 7`.
 //
 // A caller writing a length-prefixed field wants this before and after,
 // because the difference is the field's width on the wire.
-pub fn sink_bits(s: BitSink) -> Int
-    todo("bitstream_core.sink_bits")
+pub @tier(embedded)
+fn sink_bits(s: BitSink) -> Int
+    s.count
 
 // What one write produced: the sink after it, the whole bytes it
 // completed, and how many of them are real.
@@ -281,8 +305,36 @@ struct BitEmit
 //     let e = bitstream_core.put(bitstream_core.sink_lsb(), 3, 3)
 //     println("${e.len} ${e.sink.count}")   // 0 3
 // ```
-pub fn put(s: BitSink, value: Int, n: Int) -> BitEmit
-    todo("bitstream_core.put")
+pub @tier(embedded)
+fn put(s: BitSink, value: Int, n: Int) -> BitEmit
+    if n < 1 or n > max_bits()
+        return refused(s)
+    if n < 64 and (value >>> n) != 0
+        return refused(s)
+    var hold = s.hold
+    var count = s.count
+    var rest = n
+    var packed = 0
+    var len = 0
+    // At most nine pieces: the rest of a partial byte, seven whole
+    // bytes, and a tail.
+    for _i in 0..9
+        if rest > 0
+            let piece = smaller(8 - count, rest)
+            if s.order == 0
+                let piece_bits = (value >>> (n - rest)) & mask(piece)
+                hold = hold | (piece_bits << count)
+            else
+                let piece_bits = (value >>> (rest - piece)) & mask(piece)
+                hold = (hold << piece) | piece_bits
+            count = count + piece
+            rest = rest - piece
+            if count == 8
+                packed = packed | (hold << (8 * len))
+                len = len + 1
+                hold = 0
+                count = 0
+    emit(BitSink { order: s.order, hold: hold, count: count }, packed, len, true)
 
 // Pad to the next byte boundary with zero bits and answer the byte that
 // completes, if there was a partial one.
@@ -292,5 +344,62 @@ pub fn put(s: BitSink, value: Int, n: Int) -> BitEmit
 // that is what DEFLATE's final block, JPEG's restart markers and every
 // other aligned format specify; a format that pads with ones writes the
 // ones itself with `put` before calling this.
-pub fn flush(s: BitSink) -> BitEmit
-    todo("bitstream_core.flush")
+pub @tier(embedded)
+fn flush(s: BitSink) -> BitEmit
+    let empty = BitSink { order: s.order, hold: 0, count: 0 }
+    if s.count == 0
+        return emit(empty, 0, 0, true)
+    var last = s.hold
+    if s.order != 0
+        last = s.hold << (8 - s.count)
+    emit(empty, last, 1, true)
+
+// The low `n` bits set, for `n` in `0 ..= 64`.
+@tier(embedded)
+fn mask(n: Int) -> Int
+    if n >= 64
+        return -1
+    (1 << n) - 1
+
+// The smaller of two counts.
+@tier(embedded)
+fn smaller(x: Int, y: Int) -> Int
+    if x < y
+        return x
+    y
+
+// The next `n` bits of `a`, right-aligned, for `n` in `1 ..= a.count`.
+@tier(embedded)
+fn next_bits(a: BitAcc, n: Int) -> Int
+    if a.order == 0
+        return a.hold & mask(n)
+    (a.hold >>> (a.count - n)) & mask(n)
+
+// `a` with its next `n` bits dropped, for `n` in `1 ..= a.count`.
+@tier(embedded)
+fn after(a: BitAcc, n: Int) -> BitAcc
+    let left = a.count - n
+    if a.order == 0
+        if n >= 64
+            return BitAcc { order: 0, hold: 0, count: 0 }
+        return BitAcc { order: 0, hold: a.hold >>> n, count: left }
+    BitAcc { order: a.order, hold: a.hold & mask(left), count: left }
+
+// A `BitEmit` whose bytes are `packed`, low byte first.
+//
+// The array is built here as a literal because `[u8; 8]` is an inline
+// array only as a field of a `@value` struct (SPEC § 14.4), so no
+// function can answer one on its own.
+@tier(embedded)
+fn emit(s: BitSink, packed: Int, len: Int, ok: Bool) -> BitEmit
+    BitEmit { sink: s,
+              out: [(packed & 255) as u8, ((packed >>> 8) & 255) as u8,
+                    ((packed >>> 16) & 255) as u8, ((packed >>> 24) & 255) as u8,
+                    ((packed >>> 32) & 255) as u8, ((packed >>> 40) & 255) as u8,
+                    ((packed >>> 48) & 255) as u8, ((packed >>> 56) & 255) as u8],
+              len: len, ok: ok }
+
+// The answer to a refused `put`: the sink unchanged and nothing out.
+@tier(embedded)
+fn refused(s: BitSink) -> BitEmit
+    emit(s, 0, 0, false)
