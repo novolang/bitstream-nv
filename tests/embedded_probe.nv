@@ -1,116 +1,116 @@
-// tests/embedded_probe.nv — the package's device claim, as a program
-// that either builds for a Cortex-M or does not.
+// tests/embedded_probe.nv — `bitstream_core` on a microcontroller, as a
+// program that builds for a Cortex-M, boots there and checks its
+// answers.
 //
-// The shard audit's `core-embedded` row copies this and the modules its
-// `use` lines reach into a package of its own and runs
+// This file and the modules its `use` lines reach are built with
 //
-//   novo build --target=nrf52-qemu src/probe.nv
+//   novo build --target=nrf52-qemu tests/embedded_probe.nv
 //
-// which produces a real Cortex-M4 ELF or fails.  For a bit accumulator
-// the claim is the whole point: the inner loop of a DEFLATE decoder is
-// a peek, a table lookup and a skip, and a bit reader that could not
-// compile for a device would leave every embedded decompressor writing
-// its own.
+// which produces a Cortex-M4 ELF or fails.  The same ELF boots under
 //
-// It BUILDS; it does not run.  Every function it calls is a `todo()`
-// today, so a device that executed this would panic on the first line
-// of `main`.  What is being checked is the tier: `--target=nrf52-qemu`
-// stamps `@tier(embedded)` on every function it compiles, so the
-// checker walks the module and refuses a `Str` concatenation, a `Bytes`
-// call or an unbounded `while` wherever the implementation later puts
-// one.
+//   qemu-system-arm -machine mps2-an386 -nographic -semihosting -kernel probe.elf
 //
-// `bitstream` IS NOT USED HERE, and that is the split rather than a
-// convenience: that module speaks `Bytes`, the embedded runtime defines
-// no `novo_bytes_*` symbol, and one host-only function anywhere in a
-// compilation unit is an undefined symbol at embedded link time whether
-// or not the firmware calls it.
+// and writes `ok` for each of the four things it checks.  The build
+// checks something the run cannot: `--target=nrf52-qemu` stamps
+// `@tier(embedded)` on every function it compiles, so a `Str`
+// concatenation, a `Bytes` call or an unbounded `while` is refused
+// wherever it is written.
+//
+// The inner loop of a DEFLATE decoder is a peek, a table lookup and a
+// skip, and this is the half of the package a device decompressor runs.
+//
+// The `bitstream` module is not used here.  It speaks `Bytes`, the
+// embedded runtime defines no `novo_bytes_*` symbol, and one host-only
+// function anywhere in a compilation unit is an undefined symbol at
+// link time whether or not the firmware calls it.
 
 use bitstream_core
 
 // Four bytes the way firmware would hold them.
 //
-// The array is a FIELD of a `@value` struct rather than a return type,
-// because `[u8; 4]` is a true inline array only inside one — outside,
-// the annotation still means a list, and a list literal is an implicit
-// heap allocation the tier refuses (SPEC § 14.4).
+// The array is a field of a `@value` struct because `[u8; 4]` is a true
+// inline array only inside one.  Outside, the annotation still means a
+// list, and a list literal is a heap allocation a device build refuses
+// (SPEC § 14.4).
 @value
 struct ProbeBits
     b: [u8; 4]
 
-// A payload with bits set in both halves of every byte, so that a read
-// taking from the wrong end is a different number rather than the same
-// one.
+// Bits set in both halves of every byte, so a read taking from the
+// wrong end answers a different number.
 fn probe_src() -> ProbeBits
     ProbeBits { b: [0xAB as u8, 0xCD as u8, 0xEF as u8, 0x01 as u8] }
 
-fn main() [hw]
-    // The constants, so the arithmetic that reads them is compiled for
-    // the device and not only for the host.
-    let lsb = bitstream_core.lsb_first()
-    let msb = bitstream_core.msb_first()
-    let cap = bitstream_core.capacity()
-    let wide = bitstream_core.max_bits()
+fn say(label: Str, good: Bool) [hw]
+    hal.uart.write(label)
+    if good
+        hal.uart.write(": ok\n")
+    else
+        hal.uart.write(": BAD\n")
 
-    // The refill loop, which is the shape a decompressor has: pull a
-    // byte in while there is room, take a field out, repeat.
+fn main() [hw]
+    var good = bitstream_core.capacity() == 64 and bitstream_core.max_bits() == 64
+    good = good and bitstream_core.lsb_first() != bitstream_core.msb_first()
+    say("constants", good)
+
+    // The refill loop a decompressor has: pull a byte in while there is
+    // room, take a field out.
     //
     // Each step is bound with its type written out because a call into
     // another module does not have its return type inferred in a
-    // single-file build.  Inside a package built as one unit — which is
-    // what every host suite does — none of these annotations is needed.
+    // single-file build.
     let src = probe_src()
     var a: BitAcc = bitstream_core.acc_lsb()
     for i in 0..4
         if bitstream_core.acc_room(a) >= 8
             a = bitstream_core.feed(a, src.b[i])
-
-    // Peek, look up, skip — the Huffman inner loop without the table.
+    // LSB-first: 0xAB's low five bits are 01011 = 11.  Skip three, and
+    // the next nine are 0xAB's high five, 10101 = 21, below 0xCD's low
+    // four, 1101 = 13: 21 + 13 * 32 = 437.
     let seen: BitTake = bitstream_core.peek(a, 5)
-    if seen.ok
-        hal.uart.write(".")
+    good = seen.ok and seen.value == 11
     let stepped: BitTake = bitstream_core.skip(a, 3)
-    a = stepped.acc
+    let got: BitTake = bitstream_core.take(stepped.acc, 9)
+    good = good and got.ok and got.value == 437
+    // Twelve bits are gone, so four stand before the next boundary.
+    good = good and bitstream_core.to_align(got.acc) == 4
+    let aligned: BitAcc = bitstream_core.align(got.acc)
+    good = good and bitstream_core.acc_bits(aligned) == 16
+    say("lsb", good)
 
-    // And a plain take, which is every other field in every format.
-    let got: BitTake = bitstream_core.take(a, 9)
-    a = got.acc
-    if got.ok
-        hal.uart.write(".")
-
-    // The boundary arithmetic a stored block needs.
-    let gap = bitstream_core.to_align(a)
-    a = bitstream_core.align(a)
-    let live = bitstream_core.acc_bits(a)
-
-    // The MSB-first accumulator, so both orders are compiled rather
-    // than only the one this probe reads with.
+    // MSB-first, the high four bits of 0xAB first: 1010 = 10.
     var m: BitAcc = bitstream_core.acc_msb()
     m = bitstream_core.feed(m, src.b[0])
     let mt: BitTake = bitstream_core.take(m, 4)
+    good = mt.ok and mt.value == 10
+    let short: BitTake = bitstream_core.take(mt.acc, 5)
+    good = good and not short.ok
+    say("msb", good)
 
-    // The writer's mirror, driven the way an encoder in an interrupt
-    // handler drives it: bits in, whole bytes out, nothing allocated to
-    // carry either.
+    // The writer, driven the way an encoder in an interrupt handler
+    // drives it: bits in, whole bytes out.  Four fields of 101 LSB-first
+    // are 0b101101101101 = 0xb6d: the byte 0x6d, then 1011 pending,
+    // padded to 0x0b.
     var s: BitSink = bitstream_core.sink_lsb()
+    var bytes_out = 0
+    good = true
     for i in 0..4
         let e: BitEmit = bitstream_core.put(s, 5, 3)
         s = e.sink
         for k in 0..e.len
-            // A real transport would put this byte in a queue; here the
-            // read is what forces the array access to be compiled.
             let b: u8 = e.out[k]
-            hal.uart.write("-")
-
-    let pending = bitstream_core.sink_bits(s)
+            if b != (0x6d as u8)
+                good = false
+            bytes_out = bytes_out + 1
+    good = good and bitstream_core.sink_bits(s) == 4
     let last: BitEmit = bitstream_core.flush(s)
-    for k in 0..last.len
-        let b: u8 = last.out[k]
-        hal.uart.write("!")
-
-    // The MSB-first sink, for the same reason as the MSB-first
-    // accumulator above.
-    let ms: BitSink = bitstream_core.sink_msb()
-    let me: BitEmit = bitstream_core.put(ms, 1, 1)
+    good = good and bytes_out == 1 and last.len == 1
+    let tail: u8 = last.out[0]
+    good = good and tail == (0x0b as u8)
+    let ms: BitEmit = bitstream_core.put(bitstream_core.sink_msb(), 1, 1)
+    let mf: BitEmit = bitstream_core.flush(ms.sink)
+    let top: u8 = mf.out[0]
+    good = good and top == (0x80 as u8)
+    say("sink", good)
 
     hal.uart.write("bitstream-nv: bits in, bits out\n")

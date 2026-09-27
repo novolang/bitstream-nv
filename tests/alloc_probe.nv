@@ -1,0 +1,38 @@
+// tests/alloc_probe.nv — a program that reaches every function in
+// `bitstream_core`, so the emitted LLVM can be read for a call to the
+// allocator.
+//
+// This is not a test.  `tests/alloc_scan.sh` builds it with `--opt=0`
+// and reads the IR.  At the default optimisation level the whole probe
+// inlines into `novo_main`, and no function would be left to attribute
+// an allocation to.
+//
+// Every function is called, because a function the probe never reaches
+// is one the linker drops and the scan never sees.  The `bitstream`
+// module is not here: it allocates, which is what it is for.  The
+// numbers are printed rather than checked; the test suite owns
+// correctness.
+
+use bitstream_core
+
+fn main() [io]
+    println("${bitstream_core.lsb_first()} ${bitstream_core.msb_first()}")
+    println("${bitstream_core.max_bits()} ${bitstream_core.capacity()}")
+
+    var a = bitstream_core.feed(bitstream_core.acc_lsb(), 0xAB as u8)
+    a = bitstream_core.feed(a, 0xCD as u8)
+    println("${bitstream_core.acc_bits(a)} ${bitstream_core.acc_room(a)}")
+    let p = bitstream_core.peek(a, 5)
+    let s = bitstream_core.skip(a, 3)
+    let t = bitstream_core.take(s.acc, 9)
+    println("${p.value} ${t.value} ${bitstream_core.to_align(t.acc)}")
+    let al = bitstream_core.align(t.acc)
+    println("${al.count}")
+
+    let m = bitstream_core.feed(bitstream_core.acc_msb(), 0xAB as u8)
+    println("${bitstream_core.take(m, 4).value}")
+
+    let e = bitstream_core.put(bitstream_core.sink_lsb(), 5, 3)
+    let f = bitstream_core.flush(e.sink)
+    let bad = bitstream_core.put(bitstream_core.sink_msb(), 9, 3)
+    println("${bitstream_core.sink_bits(e.sink)} ${f.len} ${bad.ok}")
