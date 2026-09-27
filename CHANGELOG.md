@@ -4,6 +4,29 @@ Every published version, newest first. This file is on the publish
 allow-list, so it travels with the package: it is the only thing a
 consumer deciding whether to upgrade can read.
 
+## 0.1.0 — 2026-09-27
+
+The first implementation of the interface published as 0.0.1 and
+0.0.2: the accumulator and the sink in both bit orders, and a reader
+and a writer over `Bytes`.
+
+- `bitstream_core` carries `@tier(embedded)` on every function and
+  puts nothing on the heap.  `tests/embedded_probe.nv` runs under QEMU
+  and checks reads and writes in both orders, and `tests/alloc_scan.sh`
+  reads the emitted LLVM for a call to the allocator.
+- `bitstream.read`, `peek` and `skip` split a read wider than 56 bits
+  into two.  The accumulator is refilled a byte at a time, so at an
+  offset that is not a byte boundary it holds 64 bits less those
+  already taken from the current byte; a `bitstream_core` caller
+  reading a field that wide at such an offset takes it in two parts.
+- `bitstream.read` refuses a read past the end with the reader the
+  caller holds unchanged, and pulls in only as many bytes as the read
+  needs, so `reader_acc` after a three-bit read of a fresh reader holds
+  five bits.
+- A `bitstream.write` that completes a byte copies the writer's byte
+  list, so the writer passed in keeps its bytes.  A long stream is
+  written through `bitstream_core.put`.
+
 ## 0.0.2 — 2026-09-15
 
 README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.

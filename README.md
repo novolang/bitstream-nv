@@ -6,12 +6,6 @@ from one to fifteen. Reading them means reading bits rather than bytes.
 This package reads and writes 1 to 64 bits at a time over bytes the
 caller already holds, in both of the bit orders that real formats use.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
-
 ## What a bit stream is
 
 A bit stream is a run of bytes read as one long sequence of bits. A
@@ -92,10 +86,7 @@ fn main() [io]
                 Ok(kind) => println("final=${last.value} type=${kind.value}")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a `not implemented: bitstream.<fn>`
-panic. The tests are the specification the implementation will have to
-satisfy.
+The program prints `final=1 type=1`.
 
 ## What the package contains
 
@@ -133,34 +124,45 @@ loop on a device needs those two calls.
    The value travels in an `Int`, which is signed and 64 bits wide, and
    that is the bit pattern. A caller who wants the unsigned reading
    reads 32 bits and 32 bits and combines them.
-4. **A width outside 1 to 64 is refused.** That is
+4. **The accumulator holds 64 bits, and fewer at an offset that is not
+   a byte boundary.** It is refilled a whole byte at a time, so it holds
+   at most 64 bits less those already taken from the current byte.
+   `bitstream.read` splits a read of more than 56 bits into two. A
+   caller of `bitstream_core` reading such a field at such an offset
+   takes it in two parts.
+5. **A width outside 1 to 64 is refused.** That is
    `BitsWidthOutOfRange`. Zero bits is not a read: a caller who means
    nothing writes no call.
-5. **A read past the end is refused and moves nothing.**
-   `BitsExhausted(at, need)` gives the bit offset and the width asked
-   for. The reader comes back unchanged, so a speculative parse costs
-   nothing to abandon.
-6. **A value with a bit set above its field is refused, not masked.**
+6. **A read past the end is refused.** `BitsExhausted(at, need)` gives
+   the bit offset and the width asked for. A reader is a value, and the
+   one the caller passed in still reads from where it was, so a
+   speculative parse costs nothing to abandon.
+7. **A value with a bit set above its field is refused, not masked.**
    That is `BitsValueTooWide`. A masked value writes a document that
    decodes to a different number.
-7. **Every position is counted in bits.** `bit_pos`, `bits_left` and
+8. **Every position is counted in bits.** `bit_pos`, `bits_left` and
    `to_align` are all bit counts, because a bit stream has no other
    landmark. A caller wanting a byte offset divides by eight.
-8. **`bitstream_core` answers a flag, not a `Result`.** `BitTake.ok` and
+9. **`bitstream_core` answers a flag, not a `Result`.** `BitTake.ok` and
    `BitEmit.ok` are false for a call that did not happen, and the value
    comes back unchanged. A `@value` struct cannot be a `Result` payload,
    and a reader that allocated at each refill boundary would allocate
    once per byte of a compressed stream.
-9. **`bitstream_core.feed` needs eight bits of room.** Check
-   `acc_room` first. A byte fed with less room is dropped and the
-   accumulator comes back unchanged.
-10. **Alignment discards bits and pads with zeros.** `align` drops up to
+10. **`bitstream_core.feed` needs eight bits of room.** Check
+    `acc_room` first. A byte fed with less room is dropped and the
+    accumulator comes back unchanged.
+11. **Alignment discards bits and pads with zeros.** `align` drops up to
     seven bits and never fails. `write_align` and
     `bitstream_core.flush` pad the partial byte with zero bits. A format
     that pads with ones writes them itself first.
-11. **A Huffman decoder peeks and then skips.** Peek the longest code
+12. **A Huffman decoder peeks and then skips.** Peek the longest code
     the table holds, look the prefix up, then skip exactly the length
     the table gives. A bit stream has no way to put bits back.
+13. **A write that completes a byte copies the writer's byte list.**
+    The writer passed in keeps the bytes it had, and a long stream costs
+    time in proportion to the square of its length. A long stream is
+    written through `bitstream_core.put`, with the caller keeping the
+    bytes each call completes.
 
 ## Running on a microcontroller
 
@@ -169,17 +171,21 @@ with no heap allocator, and the compiler checks that claim on every
 build. Here the claim covers `bitstream_core` and nothing else. It takes
 and answers `Int` and `u8`, and it holds no buffer.
 
-`tests/embedded_probe.nv` is that claim as a program that either builds
-or does not. It builds today:
+`tests/embedded_probe.nv` is that claim as a program:
 
 ```bash
-novo build --target=nrf52-qemu tests/embedded_probe.nv
+novo build --target=nrf52-qemu -o probe.elf tests/embedded_probe.nv
+qemu-system-arm -machine mps2-an386 -nographic -semihosting -kernel probe.elf
 ```
 
 The probe produces a Cortex-M4 executable that fills an accumulator,
-takes, peeks, skips and aligns, then writes fields back through the
-sink. It builds and it is not run: every function it calls is a `todo()`
-today.
+takes, peeks, skips and aligns in both orders, then writes fields back
+through the sink. Under QEMU it prints `ok` for each of its four
+checks.
+
+`tests/alloc_scan.sh` reads the LLVM the compiler emits for
+`tests/alloc_probe.nv` and checks that none of the twenty-five
+functions of `bitstream_core` calls the allocator.
 
 **A device cannot use the `bitstream` module.** That module speaks
 `Bytes`, and the embedded runtime defines none of the byte-buffer
@@ -196,6 +202,9 @@ calls it. That is why the package is two modules.
 - **A read wider than 64 bits.** The value travels in one `Int`. A
   caller reading a wider field reads it in pieces.
 - **An unsigned 64-bit read.** See rule 3.
+- **A reader that reads backward.** zstd's sequence and literal streams
+  are read from the end of the buffer towards the start, which neither
+  order here does.
 - **Input and output.** The reader takes bytes the caller already holds,
   and the writer answers bytes for the caller to write somewhere. No
   function here declares an effect.
@@ -226,42 +235,28 @@ calls it. That is why the package is two modules.
 ## Tests
 
 ```bash
-novo test tests/bitstream_tests.nv      # 21 tests
+novo test tests/bitstream_tests.nv      # 36 tests
+bash tests/coverage.sh                  # line coverage over src/
+bash tests/alloc_scan.sh                # bitstream_core allocates nothing
 ```
 
 The vectors are bytes from the format specifications in the table above,
-with the arithmetic worked out by hand in a comment beside each one. The
+with the arithmetic worked out by hand in a comment beside each one.
+Ten fields of 1 to 36 bits, 111 bits in all, are written in both orders
+and compared with bytes worked out bit by bit, then read back. The
 surface follows `bitvec` in Rust and `bitstring` in Python.
 
 The suite asserts that the two orders answer different numbers from the
 same byte, that a DEFLATE block header reads as RFC 1951 writes it, that
-a stored block aligns after its header, that peek does not consume and
-skip does, that the counts are in bits, that a read past the end is
-refused and moves nothing, that a width outside 1 to 64 is refused, that
-a writer completes a byte only when it has eight bits, that a partial
-byte is padded with zeros, that a value wider than its field is refused
-rather than masked, that an MSB-first write puts a field diagram down
-left to right, and that a host reader and writer hand their state to the
-device half unchanged.
-
-The tests compile today and fail at run, each on the `not implemented`
-panic that is its body. That is the expected state of an interface
-release. They turn green one at a time as bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `bitstream_core.lsb_first`, `.msb_first`, `.max_bits`, `.capacity` | no |
-| `bitstream_core.acc_lsb`, `.acc_msb`, `.acc_bits`, `.acc_room`, `.feed` | no |
-| `bitstream_core.take`, `.peek`, `.skip`, `.to_align`, `.align` | no |
-| `bitstream_core.sink_lsb`, `.sink_msb`, `.sink_bits`, `.put`, `.flush` | no |
-| `bitstream.order_code`, `BitError.message` | no |
-| `bitstream.reader`, `.read`, `.peek`, `.skip`, `.align` | no |
-| `bitstream.bit_pos`, `.bits_left`, `.to_align` | no |
-| `bitstream.writer`, `.write`, `.write_align` | no |
-| `bitstream.writer_bits`, `.writer_bytes` | no |
-| `bitstream.reader_acc`, `.writer_sink` | no |
+a stored block aligns after its header, that PNG's one-bit pixels read
+leftmost first, that peek does not consume and skip does, that the
+counts are in bits, that a 64-bit field round-trips at an offset that is
+not a byte boundary, that each refusal is raised with its message, that
+a writer completes a byte only when it has eight bits and pads a partial
+one with zeros, that an MSB-first write puts a field diagram down left
+to right, that the accumulator holds sixty-four bits and the sink
+completes eight bytes at most, and that a host reader and writer hand
+their state to the device half unchanged.
 
 ## Licence
 

@@ -1,23 +1,25 @@
 [package]
 name        = "bitstream-nv"
-version     = "0.0.2"
-description = "Bit-level reads and writes over a caller's bytes, in both bit orders: LSB-first as DEFLATE reads, MSB-first as JPEG, PNG's filters and almost everything else read.  The state is two integers in a @value struct, so the same accumulator runs in an interrupt handler and in a decompressor on a laptop.  Interface only — every body is a todo()."
+version     = "0.1.0"
+description = "Bit-level reads and writes over a caller's bytes, in both bit orders: LSB-first as DEFLATE reads, MSB-first as JPEG, PNG's filters and almost everything else read.  The state is two integers in a @value struct, so the same accumulator runs in an interrupt handler and in a decompressor on a laptop."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+# `experimental` because no program outside this repository has used the
+# package yet, and the tests were written against the signatures rather
+# than by a consumer.
+stability   = "experimental"
 
 # `core`: shifting and masking integers the caller already holds.  No
-# function declares an effect — a bit accumulator has nowhere to put
-# one.
+# function declares an effect.
 #
-# It carries `tests/embedded_probe.nv`, so the device claim is BUILT:
+# It carries `tests/embedded_probe.nv`, which builds `bitstream_core`
+# for a Cortex-M4 and checks four answers on it under QEMU.
 # `bitstream_core` speaks `Int` and `u8` and nothing else, which is what
-# lets a DEFLATE decoder's inner loop compile for a Cortex-M.
+# lets a DEFLATE decoder's inner loop compile for a device.
+#
+# `tests/alloc_scan.sh` reads the emitted LLVM for the other half of
+# that: all twenty-five functions of `bitstream_core` appear in the IR
+# at `--opt=0` and none of them calls the allocator.
 layer       = "core"
 
 category    = "encoding"
@@ -25,7 +27,7 @@ category    = "encoding"
 tags        = ["bitstream", "bits", "bitreader", "bitwriter", "deflate", "huffman", "embedded", "sans-io"]
 repository  = "https://github.com/novolang/bitstream-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+novo        = ">= 0.13.0"
 
 [docs.pages]
 "README.md" = "Reading and writing values that are not a whole number of bytes"
