@@ -22,6 +22,9 @@ stability   = "experimental"
 # at `--opt=0` and none of them calls the allocator.
 layer       = "core"
 
+# `bitstream_core` is the module the device build covers; `bitstream` carries boxed structs and `Result` payloads, which a device build refuses.
+host_modules = ["bitstream"]
+
 category    = "encoding"
 
 tags        = ["bitstream", "bits", "bitreader", "bitwriter", "deflate", "huffman", "embedded", "sans-io"]
