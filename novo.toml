@@ -1,6 +1,6 @@
 [package]
 name        = "bitstream-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "Bit-level reads and writes over a caller's bytes, in both bit orders: LSB-first as DEFLATE reads, MSB-first as JPEG, PNG's filters and almost everything else read.  The state is two integers in a @value struct, so the same accumulator runs in an interrupt handler and in a decompressor on a laptop."
 license     = "Apache-2.0"
 
@@ -30,7 +30,7 @@ category    = "encoding"
 tags        = ["bitstream", "bits", "bitreader", "bitwriter", "deflate", "huffman", "embedded", "sans-io"]
 repository  = "https://github.com/novolang/bitstream-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.13.0"
+novo        = ">= 0.23.0"
 
 [docs.pages]
 "README.md" = "Reading and writing values that are not a whole number of bytes"
